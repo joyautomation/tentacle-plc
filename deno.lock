@@ -1,0 +1,84 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
+    "jsr:@nats-io/jetstream@3.3": "3.3.0",
+    "jsr:@nats-io/nats-core@3.3": "3.3.0",
+    "jsr:@nats-io/nats-core@3.3.0": "3.3.0",
+    "jsr:@nats-io/nkeys@2.0.3": "2.0.3",
+    "jsr:@nats-io/nuid@2.0.3": "2.0.3",
+    "jsr:@nats-io/transport-deno@3.3": "3.3.0",
+    "jsr:@std/assert@*": "1.0.15",
+    "jsr:@std/assert@1": "1.0.15",
+    "jsr:@std/bytes@^1.0.5": "1.0.5",
+    "jsr:@std/internal@^1.0.12": "1.0.12",
+    "jsr:@std/io@0.225.2": "0.225.2",
+    "npm:tweetnacl@1.0.3": "1.0.3"
+  },
+  "jsr": {
+    "@joyautomation/dark-matter@0.0.26": {
+      "integrity": "7276ddefea2448937b72ada91b3adb86efe4f01032c1dd7915900b59201cba2e"
+    },
+    "@nats-io/jetstream@3.3.0": {
+      "integrity": "131ca1ee63dc41fb4a79b8e27d0b2367dc4b3974aac8047b83757f38db85f3b4",
+      "dependencies": [
+        "jsr:@nats-io/nats-core@3.3.0"
+      ]
+    },
+    "@nats-io/nats-core@3.3.0": {
+      "integrity": "f7401e99c862867857e88f610594026fe9d0682abffdf0c261b16e9a2b1f43c1",
+      "dependencies": [
+        "jsr:@nats-io/nkeys",
+        "jsr:@nats-io/nuid"
+      ]
+    },
+    "@nats-io/nkeys@2.0.3": {
+      "integrity": "e92c96eea32b559f2e0f32555b49376942d66c07e59efff9180dbf29e516fbd8",
+      "dependencies": [
+        "npm:tweetnacl"
+      ]
+    },
+    "@nats-io/nuid@2.0.3": {
+      "integrity": "c1069446e43dfa4f5e599c398a1bfc1be0c8dab1c839b6d2b9c3617cc1998306"
+    },
+    "@nats-io/transport-deno@3.3.0": {
+      "integrity": "1b384530501d352982f8694fc122b145c6626d3583dc249fc6fc33241e502470",
+      "dependencies": [
+        "jsr:@nats-io/nats-core@3.3.0",
+        "jsr:@std/io"
+      ]
+    },
+    "@std/assert@1.0.15": {
+      "integrity": "d64018e951dbdfab9777335ecdb000c0b4e3df036984083be219ce5941e4703b",
+      "dependencies": [
+        "jsr:@std/internal"
+      ]
+    },
+    "@std/bytes@1.0.5": {
+      "integrity": "4465dd739d7963d964c809202ebea6d5c6b8e3829ef25c6a224290fbb8a1021e"
+    },
+    "@std/internal@1.0.12": {
+      "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
+    },
+    "@std/io@0.225.2": {
+      "integrity": "3c740cd4ee4c082e6cfc86458f47e2ab7cb353dc6234d5e9b1f91a2de5f4d6c7",
+      "dependencies": [
+        "jsr:@std/bytes"
+      ]
+    }
+  },
+  "npm": {
+    "tweetnacl@1.0.3": {
+      "integrity": "sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw=="
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@joyautomation/dark-matter@^0.0.26",
+      "jsr:@nats-io/jetstream@3.3",
+      "jsr:@nats-io/nats-core@3.3",
+      "jsr:@nats-io/transport-deno@3.3",
+      "jsr:@std/assert@1"
+    ]
+  }
+}
