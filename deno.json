@@ -12,6 +12,6 @@
     "@nats-io/nats-core": "jsr:@nats-io/nats-core@3.3",
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
-    "@joyautomation/nats-schema": "https://raw.githubusercontent.com/joyautomation/nats-schema/main/src/mod.ts"
+    "@joyautomation/nats-schema": "jsr:@joyautomation/nats-schema@^0.0.1"
   }
 }
