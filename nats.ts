@@ -16,7 +16,7 @@ import {
   substituteTopic,
   type PlcDataMessage,
   isPlcDataMessage,
-} from "../nats-schema/src/mod.ts";
+} from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
 /** Logger for the NATS module */

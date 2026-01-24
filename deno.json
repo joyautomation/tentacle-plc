@@ -1,4 +1,7 @@
 {
+  "name": "@joyautomation/tentacle-plc",
+  "version": "0.0.1",
+  "exports": "./mod.ts",
   "tasks": {
     "dev": "deno run --watch examples/main.ts"
   },
@@ -9,6 +12,6 @@
     "@nats-io/nats-core": "jsr:@nats-io/nats-core@3.3",
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
-    "@tentacle/nats-schema": "file://../nats-schema/src/mod.ts"
+    "@joyautomation/nats-schema": "https://raw.githubusercontent.com/joyautomation/nats-schema/main/src/mod.ts"
   }
 }
