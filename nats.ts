@@ -1,10 +1,15 @@
+/**
+ * NATS Integration Module
+ *
+ * Handles NATS connection, subscriptions, and KV storage for PLC variables.
+ */
+
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
 import { jetstream, StorageType, DiscardPolicy } from "@nats-io/jetstream";
-import {
-  type NatsConfig,
-  type PlcVariable,
-  type PlcVariables,
-  type VariableSource,
+import type {
+  NatsConfig,
+  PlcVariable,
+  VariableSource,
 } from "./types/variables.ts";
 import {
   NATS_TOPICS,
@@ -12,6 +17,10 @@ import {
   type PlcDataMessage,
   isPlcDataMessage,
 } from "../nats-schema/src/mod.ts";
+import { createLogger, LogLevel } from "@joyautomation/coral";
+
+/** Logger for the NATS module */
+const log = createLogger("nats", LogLevel.info);
 
 /** Simple KV store wrapper using NATS JetStream */
 type KVStore = {
@@ -20,16 +29,18 @@ type KVStore = {
   delete: (key: string) => Promise<void>;
 };
 
-export type NatsManager<V extends PlcVariables> = {
+export type NatsManager = {
   connection: NatsConnection;
   projectId: string;
   subscriptions: Map<string, () => Promise<void>>;
   /** Publish a variable update with schema compliance and KV storage */
   publish: (
-    variableId: keyof V,
+    variableId: string,
     value: number | boolean | string | Record<string, unknown>,
     datatype: "number" | "boolean" | "string" | "udt",
   ) => Promise<void>;
+  /** Publish all variables - useful for initial state or on request */
+  publishAll: () => Promise<void>;
   /** Low-level publish to custom subject (backward compatibility) */
   publishToSubject: (subject: string, value: string) => void;
   disconnect: () => Promise<void>;
@@ -77,9 +88,9 @@ async function createKVStore(
   // Create or get the stream
   try {
     await jsm.streams.info(streamName);
-    console.log(`Using existing KV bucket: ${bucketName}`);
+    log.debug(`Using existing KV bucket: ${bucketName}`);
   } catch {
-    console.log(`Creating new KV bucket: ${bucketName}`);
+    log.info(`Creating new KV bucket: ${bucketName}`);
     await jsm.streams.add({
       name: streamName,
       subjects: [`${subjectPrefix}.>`],
@@ -87,7 +98,7 @@ async function createKVStore(
       discard: DiscardPolicy.New,
       max_age: 0, // No TTL for KV
     });
-    console.log(`KV bucket created: ${bucketName}`);
+    log.info(`KV bucket created: ${bucketName}`);
   }
 
   // Return KV store interface
@@ -101,7 +112,6 @@ async function createKVStore(
     get: async (key: string): Promise<Uint8Array | null> => {
       const subject = `${subjectPrefix}.${key}`;
       try {
-        // Try to get the last message from the stream
         const msg = await jsm.streams.getMessage(streamName, {
           last_by_subj: subject,
         });
@@ -110,14 +120,12 @@ async function createKVStore(
         }
         return null;
       } catch {
-        // Key doesn't exist
         return null;
       }
     },
 
     delete: (key: string) => {
       const subject = `${subjectPrefix}.${key}`;
-      // Delete by publishing a marker (KV delete marker is an empty message)
       js.publish(subject, new Uint8Array(0));
       return Promise.resolve();
     },
@@ -126,23 +134,22 @@ async function createKVStore(
 
 /**
  * Establish a connection to NATS and set up variable subscriptions.
- * Integrates with @tentacle/nats-schema for automatic schema compliance.
  *
  * @param config - NATS configuration
- * @param variables - PLC variables with NATS sources
+ * @param variables - PLC runtime variables
  * @param projectId - Project identifier for schema topics
  * @param onVariableUpdate - Callback when a variable is updated from NATS
  * @returns NatsManager for publishing and managing subscriptions
  */
-export async function setupNats<V extends PlcVariables>(
+export async function setupNats(
   config: NatsConfig,
-  variables: V,
+  variables: Record<string, PlcVariable>,
   projectId: string,
   onVariableUpdate: (
-    variableId: keyof V,
+    variableId: string,
     value: number | boolean | string | Record<string, unknown>,
   ) => void,
-): Promise<NatsManager<V>> {
+): Promise<NatsManager> {
   const nc = await connect({
     servers: config.servers,
     user: config.user,
@@ -150,49 +157,42 @@ export async function setupNats<V extends PlcVariables>(
     token: config.token,
   });
 
+  log.info(`Connected to NATS: ${config.servers}`);
+
   const subscriptions = new Map<string, () => Promise<void>>();
   const handlers = new Map<string, SubscriptionHandler>();
 
-  // Initialize centralized KV store for persistence
+  // Initialize KV store
   const kvBucketName = `plc-variables-${projectId}`;
   let kv: KVStore | null = null;
   try {
-    console.log("Initializing centralized KV store...");
     kv = await createKVStore(nc, kvBucketName);
-    console.log("KV store initialized successfully");
   } catch (error) {
-    console.warn(
-      "KV store initialization failed - variable state will not be persisted:",
-      error,
-    );
+    log.warn("KV store initialization failed:", error);
   }
 
-  // Restore variable state from KV on startup
-  console.log("Restoring variable state from KV...");
+  // Restore variable state from KV
   for (const [variableId, variable] of Object.entries(variables)) {
     if (kv) {
       try {
-        const kvData = await kv.get(variableId as string);
+        const kvData = await kv.get(variableId);
         if (kvData) {
           const kvValue = JSON.parse(new TextDecoder().decode(kvData)) as {
             value: number | boolean | string | Record<string, unknown>;
           };
-          // Directly assign to the variable's value property
-          (variable as Record<string, unknown>).value = kvValue.value;
-          console.log(`Restored ${variableId} = ${kvValue.value}`);
+          variable.value = kvValue.value;
+          log.debug(`Restored ${variableId} = ${JSON.stringify(kvValue.value)}`);
         }
       } catch {
-        // KV entry doesn't exist, keep default value
-        console.log(`No persisted state found for ${variableId}, using default`);
+        // No persisted state, keep default
       }
     }
   }
 
   // Set up subscriptions for variables with NATS sources
   for (const [variableId, variable] of Object.entries(variables)) {
-    const typedVariable = variable as PlcVariable;
-    if (hasNatsSource(typedVariable)) {
-      const subject = getSubject(typedVariable, projectId, variableId as string);
+    if (hasNatsSource(variable)) {
+      const subject = getSubject(variable, projectId, variableId);
       const abort = new AbortController();
 
       const sub = nc.subscribe(subject);
@@ -207,21 +207,21 @@ export async function setupNats<V extends PlcVariables>(
           for await (const msg of sub) {
             if (abort.signal.aborted) break;
             try {
-              const value = msg.string();
-              const parsedValue = parseValue(value, typedVariable.datatype);
-              onVariableUpdate(variableId as keyof V, parsedValue);
+              const rawValue = msg.string();
+              const parsedValue = parseValue(rawValue, variable.datatype);
+
+              // Apply onResponse transform if configured
+              const finalValue = variable.source.onResponse
+                ? variable.source.onResponse(parsedValue as number | boolean | string)
+                : parsedValue;
+
+              onVariableUpdate(variableId, finalValue);
             } catch (error) {
-              console.error(
-                `Error processing NATS message on subject ${subject}:`,
-                error,
-              );
+              log.error(`Error processing message on ${subject}:`, error);
             }
           }
         } catch (error) {
-          console.error(
-            `Error in subscription handler for subject ${subject}:`,
-            error,
-          );
+          log.error(`Error in subscription for ${subject}:`, error);
         }
       })();
 
@@ -229,65 +229,95 @@ export async function setupNats<V extends PlcVariables>(
     }
   }
 
-  return {
+  // Helper function to publish all variables
+  const publishAllVariables = async (
+    publishFn: NatsManager["publish"],
+  ): Promise<void> => {
+    log.info("Publishing all variables...");
+    for (const [variableId, variable] of Object.entries(variables)) {
+      await publishFn(variableId, variable.value, variable.datatype);
+    }
+    log.info(`Published ${Object.keys(variables).length} variables`);
+  };
+
+  // Subscribe to variable report requests
+  const requestSubject = substituteTopic(NATS_TOPICS.plc.variablesRequest, {
+    projectId,
+  });
+  const requestSub = nc.subscribe(requestSubject);
+  const requestAbort = new AbortController();
+
+  subscriptions.set(requestSubject, async () => {
+    requestAbort.abort();
+    await requestSub.unsubscribe();
+  });
+
+  // Create the publish function first so it can be used by publishAll
+  const publish = async (
+    variableId: string,
+    value: number | boolean | string | Record<string, unknown>,
+    datatype: "number" | "boolean" | "string" | "udt",
+  ): Promise<void> => {
+    // Get variable config for transforms
+    const variable = variables[variableId];
+    let finalValue = value;
+
+    // Apply onSend transform if configured
+    if (variable?.source?.onSend && typeof value !== "object") {
+      finalValue = variable.source.onSend(value as number | boolean | string);
+    }
+
+    // Create schema-compliant message
+    const schemaMessage: PlcDataMessage = {
+      projectId,
+      variableId,
+      value: finalValue,
+      timestamp: Date.now(),
+      datatype,
+    };
+
+    if (!isPlcDataMessage(schemaMessage)) {
+      throw new Error(`Invalid PLC message: ${JSON.stringify(schemaMessage)}`);
+    }
+
+    // Publish to schema topic
+    const schemaSubject = substituteTopic(NATS_TOPICS.plc.data, {
+      projectId,
+      variableId,
+    });
+
+    nc.publish(schemaSubject, JSON.stringify(schemaMessage));
+
+    // Store in KV with full schema
+    if (kv) {
+      try {
+        const kvValue = {
+          projectId,
+          variableId,
+          value: finalValue,
+          datatype,
+          lastUpdated: Date.now(),
+          source: "plc" as const,
+          quality: "good" as const,
+          deadband: variable?.deadband,
+          disableRBE: variable?.disableRBE,
+        };
+        await kv.put(variableId, new TextEncoder().encode(JSON.stringify(kvValue)));
+      } catch (error) {
+        log.warn(`Failed to store in KV: ${variableId}`, error);
+      }
+    }
+  };
+
+  // Create the manager
+  const manager: NatsManager = {
     connection: nc,
     projectId,
     subscriptions,
+    publish,
 
-    /**
-     * Publish a variable update following @tentacle/nats-schema.
-     * Automatically publishes to schema topic and stores in KV.
-     */
-    publish: async (
-      variableId: keyof V,
-      value: number | boolean | string | Record<string, unknown>,
-      datatype: "number" | "boolean" | "string" | "udt",
-    ) => {
-      // Create schema-compliant message
-      const schemaMessage: PlcDataMessage = {
-        projectId,
-        variableId: variableId as string,
-        value,
-        timestamp: Date.now(),
-        datatype,
-      };
+    publishAll: () => publishAllVariables(publish),
 
-      // Validate message against schema
-      if (!isPlcDataMessage(schemaMessage)) {
-        throw new Error(
-          `Invalid PLC message: ${JSON.stringify(schemaMessage)}`,
-        );
-      }
-
-      // Publish to schema topic
-      const schemaSubject = substituteTopic(NATS_TOPICS.plc.data, {
-        projectId,
-        variableId: variableId as string,
-      });
-
-      nc.publish(schemaSubject, JSON.stringify(schemaMessage));
-
-      // Store in KV for state persistence if available
-      if (kv) {
-        try {
-          const kvValue = { value };
-          await kv.put(
-            variableId as string,
-            new TextEncoder().encode(JSON.stringify(kvValue)),
-          );
-        } catch (error) {
-          console.warn(
-            `Failed to store variable state in KV: ${String(variableId)}`,
-            error,
-          );
-        }
-      }
-    },
-
-    /**
-     * Low-level publish to a custom subject (backward compatibility).
-     * Use publish() for schema-compliant publishing instead.
-     */
     publishToSubject: (subject: string, value: string) => {
       nc.publish(subject, value);
     },
@@ -297,24 +327,45 @@ export async function setupNats<V extends PlcVariables>(
       for (const handler of handlers.values()) {
         handler.abort.abort();
       }
+      requestAbort.abort();
 
-      // Unsubscribe from all subjects
+      // Unsubscribe
       for (const unsubscribe of subscriptions.values()) {
         await unsubscribe();
       }
 
-      // Wait for handlers to finish
+      // Wait for handlers
       await Promise.all(Array.from(handlers.values()).map((h) => h.promise));
 
       subscriptions.clear();
       handlers.clear();
       await nc.close();
+      log.info("Disconnected from NATS");
     },
   };
+
+  // Handle variable report requests
+  (async () => {
+    try {
+      for await (const msg of requestSub) {
+        if (requestAbort.signal.aborted) break;
+        log.info(`Received variables request from ${msg.subject}`);
+        await manager.publishAll();
+      }
+    } catch (error) {
+      if (!requestAbort.signal.aborted) {
+        log.error("Error in variables request handler:", error);
+      }
+    }
+  })();
+
+  log.info(`Listening for variable requests on: ${requestSubject}`);
+
+  return manager;
 }
 
 /**
- * Parse a string value based on the PLC variable datatype.
+ * Parse a string value based on datatype.
  */
 export function parseValue(
   value: string,
@@ -325,8 +376,7 @@ export function parseValue(
       return Number(value);
     case "boolean": {
       const lower = value.toLowerCase().trim();
-      return lower === "true" || lower === "1" || lower === "on" ||
-        lower === "yes";
+      return lower === "true" || lower === "1" || lower === "on" || lower === "yes";
     }
     case "string":
       return value;
@@ -334,13 +384,9 @@ export function parseValue(
       try {
         return JSON.parse(value);
       } catch {
-        console.warn(
-          `Failed to parse UDT value as JSON, returning as string: ${value}`,
-        );
         return value;
       }
     default:
-      console.warn(`Unknown datatype: ${datatype}, returning value as string`);
       return value;
   }
 }

@@ -1,3 +1,9 @@
+/**
+ * PLC Variable Type Definitions
+ *
+ * Separates configuration types (what user defines) from runtime types (with values).
+ */
+
 export type NatsConfig = {
   servers: string | string[];
   user?: string;
@@ -5,11 +11,16 @@ export type NatsConfig = {
   token?: string;
 };
 
+/** NATS source configuration for bidirectional communication */
 export type VariableSource = {
+  /** Custom subject override. Defaults to: ${projectId}/${variableId} */
   subject?: string;
+  /** Enable bidirectional communication (receive commands from NATS) */
   bidirectional?: boolean;
-  onResponse?: (value: number | boolean | string) => void;
-  onSend?: (value: number | boolean | string) => void;
+  /** Transform incoming values before applying */
+  onResponse?: (value: number | boolean | string) => number | boolean | string;
+  /** Transform outgoing values before publishing */
+  onSend?: (value: number | boolean | string) => number | boolean | string;
 };
 
 /** Report By Exception (RBE) deadband configuration */
@@ -20,7 +31,11 @@ export type DeadBandConfig = {
   maxTime?: number;
 };
 
-export type PlcVariableBase = {
+// =============================================================================
+// Configuration Types (what user defines - no runtime value)
+// =============================================================================
+
+export type PlcVariableConfigBase = {
   id: string;
   description: string;
   source?: VariableSource;
@@ -30,29 +45,84 @@ export type PlcVariableBase = {
   disableRBE?: boolean;
 };
 
-export type PlcVariableNumber = PlcVariableBase & {
+export type PlcVariableNumberConfig = PlcVariableConfigBase & {
   datatype: "number";
   default: number;
+};
+
+export type PlcVariableBooleanConfig = PlcVariableConfigBase & {
+  datatype: "boolean";
+  default: boolean;
+};
+
+export type PlcVariableStringConfig = PlcVariableConfigBase & {
+  datatype: "string";
+  default: string;
+};
+
+export type PlcVariableUdtConfig<T = Record<string, unknown>> = PlcVariableConfigBase & {
+  datatype: "udt";
+  default: T;
+};
+
+export type PlcVariableConfig =
+  | PlcVariableNumberConfig
+  | PlcVariableBooleanConfig
+  | PlcVariableStringConfig
+  | PlcVariableUdtConfig;
+
+/** Map of variable IDs to their configurations */
+export type PlcVariablesConfig<
+  V extends Record<string, PlcVariableConfig> = Record<string, PlcVariableConfig>
+> = V;
+
+// =============================================================================
+// Runtime Types (configuration + current value)
+// =============================================================================
+
+export type PlcVariableNumber = PlcVariableNumberConfig & {
   value: number;
 };
 
-export type PlcVariableBoolean = PlcVariableBase & {
-  datatype: "boolean";
-  default: boolean;
+export type PlcVariableBoolean = PlcVariableBooleanConfig & {
   value: boolean;
 };
 
-export type PlcVariableString = PlcVariableBase & {
-  datatype: "string";
-  default: string;
+export type PlcVariableString = PlcVariableStringConfig & {
   value: string;
 };
 
-export type PlcVariableUdt<T> = PlcVariableBase & {
-  datatype: "udt";
-  default: T;
+export type PlcVariableUdt<T = Record<string, unknown>> = PlcVariableUdtConfig<T> & {
   value: T;
 };
+
+export type PlcVariable =
+  | PlcVariableNumber
+  | PlcVariableBoolean
+  | PlcVariableString
+  | PlcVariableUdt;
+
+/** Map of variable IDs to their runtime state */
+export type PlcVariables<
+  V extends Record<string, PlcVariable> = Record<string, PlcVariable>
+> = V;
+
+/** Transform config variables to runtime variables with values */
+export type PlcVariablesRuntime<V extends PlcVariablesConfig> = {
+  [K in keyof V]: V[K] extends PlcVariableNumberConfig
+    ? PlcVariableNumber
+    : V[K] extends PlcVariableBooleanConfig
+      ? PlcVariableBoolean
+      : V[K] extends PlcVariableStringConfig
+        ? PlcVariableString
+        : V[K] extends PlcVariableUdtConfig<infer T>
+          ? PlcVariableUdt<T>
+          : never;
+};
+
+// =============================================================================
+// Type Guards
+// =============================================================================
 
 export const isVariableType = <T>(
   variable: unknown,
@@ -68,48 +138,17 @@ export const isVariableNumber = (
 ): variable is PlcVariableNumber =>
   isVariableType<PlcVariableNumber>(variable, "number");
 
-/**
- * Type guard to check if a variable is a boolean PLC variable.
- * @param variable - The variable to check
- * @returns True if the variable is a boolean PLC variable
- * @public
- */
 export const isVariableBoolean = (
   variable: unknown,
 ): variable is PlcVariableBoolean =>
   isVariableType<PlcVariableBoolean>(variable, "boolean");
 
-/**
- * Type guard to check if a variable is a string PLC variable.
- * @param variable - The variable to check
- * @returns True if the variable is a string PLC variable
- * @public
- */
 export const isVariableString = (
   variable: unknown,
 ): variable is PlcVariableString =>
   isVariableType<PlcVariableString>(variable, "string");
 
-/**
- * Type guard to check if a variable is a user-defined type (UDT) PLC variable.
- * @param variable - The variable to check
- * @returns True if the variable is a UDT PLC variable
- * @public
- */
 export const isVariableUdt = (
   variable: unknown,
-): variable is PlcVariableUdt<unknown> =>
-  isVariableType<PlcVariableUdt<unknown>>(variable, "udt");
-
-export type PlcVariable =
-  | PlcVariableNumber
-  | PlcVariableBoolean
-  | PlcVariableString
-  | PlcVariableUdt<unknown>;
-
-export type PlcVariables<
-  V extends Record<string, PlcVariable> = Record<
-    string,
-    PlcVariable
-  >,
-> = V;
+): variable is PlcVariableUdt =>
+  isVariableType<PlcVariableUdt>(variable, "udt");
