@@ -270,6 +270,7 @@ export async function setupNats(
     // Create schema-compliant message
     const schemaMessage: PlcDataMessage = {
       projectId,
+      deviceId: projectId, // For tentacle-plc runtime, use projectId as deviceId
       variableId,
       value: finalValue,
       timestamp: Date.now(),
