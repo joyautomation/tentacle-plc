@@ -90,6 +90,10 @@ export type { EipDevice, EthernetIPSource } from "./ethernetip.ts";
 export { opcuaTag } from "./opcua.ts";
 export type { OpcUaDevice, OpcUaSource } from "./opcua.ts";
 
+// Modbus source helpers
+export { modbusTag } from "./modbus.ts";
+export type { ModbusDevice, ModbusSource } from "./modbus.ts";
+
 // NATS utilities (for advanced usage)
 export { parseValue } from "./nats.ts";
 export type { NatsManager } from "./nats.ts";
