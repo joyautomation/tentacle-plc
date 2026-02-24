@@ -3,7 +3,10 @@
   "specifiers": {
     "jsr:@joyautomation/coral@^0.0.12": "0.0.12",
     "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
+    "jsr:@joyautomation/tentacle-nats-schema@^0.0.1": "0.0.1",
     "jsr:@nats-io/jetstream@3.3": "3.3.0",
+    "jsr:@nats-io/jetstream@3.3.0": "3.3.0",
+    "jsr:@nats-io/kv@3": "3.3.0",
     "jsr:@nats-io/nats-core@3.3": "3.3.0",
     "jsr:@nats-io/nats-core@3.3.0": "3.3.0",
     "jsr:@nats-io/nkeys@2.0.3": "2.0.3",
@@ -27,9 +30,19 @@
     "@joyautomation/dark-matter@0.0.26": {
       "integrity": "7276ddefea2448937b72ada91b3adb86efe4f01032c1dd7915900b59201cba2e"
     },
+    "@joyautomation/tentacle-nats-schema@0.0.1": {
+      "integrity": "05ab61f736ed2c22e979aafba75079e3af23c4f160c484d46f2ccbdaec65c9d5"
+    },
     "@nats-io/jetstream@3.3.0": {
       "integrity": "131ca1ee63dc41fb4a79b8e27d0b2367dc4b3974aac8047b83757f38db85f3b4",
       "dependencies": [
+        "jsr:@nats-io/nats-core@3.3.0"
+      ]
+    },
+    "@nats-io/kv@3.3.0": {
+      "integrity": "5aadf754bc74dc6c6423b7341c36a7612461a211d470e22cd59b78e4d6eecd6b",
+      "dependencies": [
+        "jsr:@nats-io/jetstream@3.3.0",
         "jsr:@nats-io/nats-core@3.3.0"
       ]
     },
@@ -87,7 +100,9 @@
     "dependencies": [
       "jsr:@joyautomation/coral@^0.0.12",
       "jsr:@joyautomation/dark-matter@^0.0.26",
+      "jsr:@joyautomation/tentacle-nats-schema@^0.0.1",
       "jsr:@nats-io/jetstream@3.3",
+      "jsr:@nats-io/kv@3",
       "jsr:@nats-io/nats-core@3.3",
       "jsr:@nats-io/transport-deno@3.3",
       "jsr:@std/assert@1"

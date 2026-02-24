@@ -10,11 +10,10 @@ import type {
   PlcVariablesRuntime,
   PlcVariable,
 } from "./types/variables.ts";
-import { setupNats } from "./nats.ts";
-import { createLogger, LogLevel, type Log } from "@joyautomation/coral";
+import { setupNats, type NatsManager } from "./nats.ts";
+import { enableNatsLogging, createPlcLogger } from "./logger.ts";
 
-/** Default logger for the PLC module */
-const log = createLogger("plc", LogLevel.info);
+const log = createPlcLogger("plc");
 
 /**
  * Initialize runtime variables from configuration.
@@ -82,20 +81,47 @@ export async function createPlc<V extends PlcVariablesConfig>(
     running: false,
   };
 
-  // Setup NATS connection
+  // Create stop function reference so shutdown handler can call it
+  let stopFn: (() => Promise<void>) | null = null;
+
+  // Deferred publish — assigned after setupNats returns
+  let natsPublish: NatsManager["publish"] | null = null;
+
+  // Setup NATS connection (with shutdown callback)
   const natsManager = await setupNats(
     config.nats,
     runtime.variables as Record<string, PlcVariable>,
     config.projectId,
     (variableId, value) => {
-      // Handle incoming NATS commands
+      // Handle incoming variable updates (from EIP, NATS sources, etc.)
       const variable = runtime.variables[variableId as keyof V];
       if (variable) {
         log.debug(`[NATS] ${String(variableId)} <- ${value}`);
         (variable as PlcVariable).value = value;
+        // Re-publish so downstream services (MQTT, etc.) see the update
+        natsPublish?.(
+          variableId,
+          value,
+          (variable as PlcVariable).datatype,
+        ).catch((err) => {
+          log.error(`Failed to re-publish ${String(variableId)}:`, err);
+        });
       }
     },
+    async () => {
+      // Shutdown callback — triggered when shutdown command received via NATS
+      if (stopFn) {
+        await stopFn();
+      }
+      Deno.exit(0);
+    },
   );
+
+  // Wire up deferred publish now that natsManager exists
+  natsPublish = natsManager.publish;
+
+  // Enable NATS log streaming for all loggers
+  enableNatsLogging(natsManager.connection, "plc", config.projectId);
 
   // Create updateVariable function for tasks
   const createUpdateVariable = () => {
@@ -148,27 +174,34 @@ export async function createPlc<V extends PlcVariablesConfig>(
   log.info(`Publishing to: plc.data.${config.projectId}.<variableId>`);
   log.info(`Listening on: ${config.projectId}/<variableId>`);
 
+  // Define stop function
+  const stop = async () => {
+    log.info("Stopping PLC...");
+    runtime.running = false;
+
+    // Stop all tasks
+    for (const [taskId, interval] of runtime.taskIntervals) {
+      clearInterval(interval);
+      log.debug(`  Stopped task: ${taskId}`);
+    }
+    runtime.taskIntervals.clear();
+
+    // Disconnect NATS (also cleans up heartbeat)
+    await natsManager.disconnect();
+    log.info("PLC stopped.");
+  };
+
+  // Wire up shutdown callback
+  stopFn = stop;
+
   // Return PLC instance
   return {
     config,
     runtime,
-    stop: async () => {
-      log.info("Stopping PLC...");
-      runtime.running = false;
-
-      // Stop all tasks
-      for (const [taskId, interval] of runtime.taskIntervals) {
-        clearInterval(interval);
-        log.debug(`  Stopped task: ${taskId}`);
-      }
-      runtime.taskIntervals.clear();
-
-      // Disconnect NATS
-      await natsManager.disconnect();
-      log.info("PLC stopped.");
-    },
+    stop,
   };
 }
 
 // Re-export coral for downstream projects
 export { createLogger, LogLevel, type Log } from "@joyautomation/coral";
+export { createPlcLogger } from "./logger.ts";

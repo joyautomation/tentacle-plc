@@ -21,6 +21,23 @@ export type VariableSource = {
   onResponse?: (value: number | boolean | string) => number | boolean | string;
   /** Transform outgoing values before publishing */
   onSend?: (value: number | boolean | string) => number | boolean | string;
+  /** EtherNet/IP tag source — subscribes to ethernetip scanner for this tag */
+  ethernetip?: { deviceId: string; host: string; port: number; tag: string; scanRate?: number };
+  /** OPC UA node source — subscribes to opcua scanner for this node */
+  opcua?: { deviceId: string; endpointUrl: string; nodeId: string; scanRate?: number };
+  /** Modbus tag source — subscribes to modbus scanner for this tag */
+  modbus?: {
+    deviceId: string;
+    host: string;
+    port: number;
+    unitId: number;
+    tag: string;
+    address: number;
+    functionCode: "coil" | "discrete" | "holding" | "input";
+    modbusDatatype: string;
+    byteOrder: string;
+    scanRate?: number;
+  };
 };
 
 /** Report By Exception (RBE) deadband configuration */
@@ -60,9 +77,28 @@ export type PlcVariableStringConfig = PlcVariableConfigBase & {
   default: string;
 };
 
+/**
+ * Sparkplug B UDT template definition for a PLC UDT variable.
+ * When provided, tentacle-mqtt publishes this variable as a Sparkplug B
+ * Template Instance rather than a plain JSON string.
+ */
+export type UdtTemplateDefinition = {
+  /** Template type name used as templateRef in Sparkplug B (e.g. "MotorDrive") */
+  name: string;
+  version?: string;
+  members: Array<{
+    name: string;
+    datatype: "number" | "boolean" | "string";
+    description?: string;
+  }>;
+};
+
 export type PlcVariableUdtConfig<T = Record<string, unknown>> = PlcVariableConfigBase & {
   datatype: "udt";
   default: T;
+  /** Optional Sparkplug B template definition. When set, tentacle-mqtt publishes
+   *  this variable as a Template Instance rather than a JSON-stringified string. */
+  udtTemplate?: UdtTemplateDefinition;
 };
 
 export type PlcVariableConfig =

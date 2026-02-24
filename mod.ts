@@ -39,7 +39,7 @@
  */
 
 // Main factory function
-export { createPlc, createLogger, LogLevel, type Log } from "./plc.ts";
+export { createPlc, createLogger, createPlcLogger, LogLevel, type Log } from "./plc.ts";
 
 // Configuration types
 export type {
@@ -81,6 +81,14 @@ export {
   isVariableUdt,
   isVariableType,
 } from "./types/variables.ts";
+
+// EtherNet/IP source helpers
+export { eipTag } from "./ethernetip.ts";
+export type { EipDevice, EthernetIPSource } from "./ethernetip.ts";
+
+// OPC UA source helpers
+export { opcuaTag } from "./opcua.ts";
+export type { OpcUaDevice, OpcUaSource } from "./opcua.ts";
 
 // NATS utilities (for advanced usage)
 export { parseValue } from "./nats.ts";

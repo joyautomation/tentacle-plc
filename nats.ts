@@ -6,6 +6,7 @@
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
 import { jetstream, StorageType, DiscardPolicy } from "@nats-io/jetstream";
+import { Kvm, type KV } from "@nats-io/kv";
 import type {
   NatsConfig,
   PlcVariable,
@@ -17,10 +18,19 @@ import {
   type PlcDataMessage,
   isPlcDataMessage,
 } from "@joyautomation/nats-schema";
-import { createLogger, LogLevel } from "@joyautomation/coral";
 
-/** Logger for the NATS module */
-const log = createLogger("nats", LogLevel.info);
+/** Service heartbeat entry — matches tentacle-nats-schema ServiceHeartbeat */
+interface ServiceHeartbeat {
+  serviceType: string;
+  moduleId: string;
+  lastSeen: number;
+  startedAt: number;
+  version?: string;
+  metadata?: Record<string, unknown>;
+}
+import { createPlcLogger } from "./logger.ts";
+
+const log = createPlcLogger("nats");
 
 /** Simple KV store wrapper using NATS JetStream */
 type KVStore = {
@@ -149,6 +159,7 @@ export async function setupNats(
     variableId: string,
     value: number | boolean | string | Record<string, unknown>,
   ) => void,
+  onShutdown?: () => Promise<void>,
 ): Promise<NatsManager> {
   const nc = await connect({
     servers: config.servers,
@@ -158,6 +169,75 @@ export async function setupNats(
   });
 
   log.info(`Connected to NATS: ${config.servers}`);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Heartbeat publishing for service discovery
+  // ═══════════════════════════════════════════════════════════════════════════
+  const jsClient = jetstream(nc);
+  const kvm = new Kvm(jsClient);
+  let heartbeatsKv: KV | null = null;
+  let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  const startedAt = Date.now();
+
+  try {
+    heartbeatsKv = await kvm.create("service_heartbeats", {
+      history: 1,
+      ttl: 60 * 1000, // 1 minute TTL
+    });
+
+    const publishHeartbeat = async () => {
+      const heartbeat: ServiceHeartbeat = {
+        serviceType: "plc",
+        moduleId: projectId,
+        lastSeen: Date.now(),
+        startedAt,
+        metadata: {
+          cwd: Deno.cwd(),
+        },
+      };
+      try {
+        const encoder = new TextEncoder();
+        await heartbeatsKv!.put(
+          projectId,
+          encoder.encode(JSON.stringify(heartbeat)),
+        );
+      } catch (err) {
+        log.warn(`Failed to publish heartbeat: ${err}`);
+      }
+    };
+
+    await publishHeartbeat();
+    log.info(`Service heartbeat started (moduleId: ${projectId})`);
+    heartbeatInterval = setInterval(publishHeartbeat, 10000);
+  } catch (err) {
+    log.warn(`Failed to initialize heartbeat publishing: ${err}`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Shutdown command listener
+  // ═══════════════════════════════════════════════════════════════════════════
+  const shutdownSubject = `${projectId}.shutdown`;
+  const shutdownSub = nc.subscribe(shutdownSubject);
+  const shutdownAbort = new AbortController();
+
+  (async () => {
+    try {
+      for await (const _msg of shutdownSub) {
+        if (shutdownAbort.signal.aborted) break;
+        log.info(`Received shutdown command on ${shutdownSubject}`);
+        if (onShutdown) {
+          await onShutdown();
+        }
+        break;
+      }
+    } catch (error) {
+      if (!shutdownAbort.signal.aborted) {
+        log.error("Error in shutdown listener:", error);
+      }
+    }
+  })();
+
+  log.info(`Listening for shutdown on: ${shutdownSubject}`);
 
   const subscriptions = new Map<string, () => Promise<void>>();
   const handlers = new Map<string, SubscriptionHandler>();
@@ -229,6 +309,548 @@ export async function setupNats(
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EtherNet/IP source subscriptions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Collect variables sourced from EtherNet/IP (with connection info)
+  const eipVariables = new Map<
+    string,
+    { variableId: string; tag: string; deviceId: string; host: string; port: number; scanRate?: number }
+  >();
+  for (const [variableId, variable] of Object.entries(variables)) {
+    if (variable.source?.ethernetip) {
+      eipVariables.set(variableId, {
+        variableId,
+        ...variable.source.ethernetip,
+      });
+    }
+  }
+
+  let eipRetryInterval: ReturnType<typeof setInterval> | null = null;
+
+  if (eipVariables.size > 0) {
+    log.info(
+      `Setting up EtherNet/IP sources for ${eipVariables.size} variable(s)`,
+    );
+
+    // Sanitize tag names for NATS subjects (same as ethernetip scanner)
+    const sanitizeForSubject = (tag: string): string =>
+      tag.replace(/\./g, "_");
+
+    // Subscribe to data topics immediately — NATS subscriptions work before
+    // ethernetip publishes, so no messages are missed.
+    for (const [variableId, eipVar] of eipVariables) {
+      const subject = `ethernetip.data.${eipVar.deviceId}.${sanitizeForSubject(eipVar.tag)}`;
+      const abort = new AbortController();
+      const sub = nc.subscribe(subject);
+
+      subscriptions.set(subject, async () => {
+        abort.abort();
+        await sub.unsubscribe();
+      });
+
+      const handlerPromise = (async () => {
+        try {
+          for await (const msg of sub) {
+            if (abort.signal.aborted) break;
+            try {
+              const data = JSON.parse(msg.string()) as {
+                value: number | boolean | string | null;
+              };
+              if (data.value !== null && data.value !== undefined) {
+                onVariableUpdate(variableId, data.value);
+              }
+            } catch (error) {
+              log.error(
+                `Error processing EIP data on ${subject}:`,
+                error,
+              );
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) {
+            log.error(`Error in EIP subscription for ${subject}:`, error);
+          }
+        }
+      })();
+
+      handlers.set(subject, { abort, promise: handlerPromise });
+      log.debug(`Subscribed to EIP data: ${subject} → ${variableId}`);
+    }
+
+    // Also subscribe to batch data topics per device
+    const deviceIds = new Set(
+      [...eipVariables.values()].map((v) => v.deviceId),
+    );
+    for (const deviceId of deviceIds) {
+      const batchSubject = `ethernetip.data.${deviceId}`;
+      const abort = new AbortController();
+      const sub = nc.subscribe(batchSubject);
+
+      subscriptions.set(batchSubject, async () => {
+        abort.abort();
+        await sub.unsubscribe();
+      });
+
+      // Build a lookup from tag name → variableId for this device
+      const tagToVariable = new Map<string, string>();
+      for (const [variableId, eipVar] of eipVariables) {
+        if (eipVar.deviceId === deviceId) {
+          tagToVariable.set(eipVar.tag, variableId);
+        }
+      }
+
+      const handlerPromise = (async () => {
+        try {
+          for await (const msg of sub) {
+            if (abort.signal.aborted) break;
+            try {
+              const batch = JSON.parse(msg.string()) as {
+                values: Array<{
+                  variableId: string;
+                  value: number | boolean | string | null;
+                }>;
+              };
+              if (batch.values) {
+                for (const entry of batch.values) {
+                  const plcVarId = tagToVariable.get(entry.variableId);
+                  if (
+                    plcVarId &&
+                    entry.value !== null &&
+                    entry.value !== undefined
+                  ) {
+                    onVariableUpdate(plcVarId, entry.value);
+                  }
+                }
+              }
+            } catch (error) {
+              log.error(
+                `Error processing EIP batch on ${batchSubject}:`,
+                error,
+              );
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) {
+            log.error(
+              `Error in EIP batch subscription for ${batchSubject}:`,
+              error,
+            );
+          }
+        }
+      })();
+
+      handlers.set(batchSubject, { abort, promise: handlerPromise });
+      log.debug(`Subscribed to EIP batch data: ${batchSubject}`);
+    }
+
+    // Group EIP variables by device for per-device subscribe requests
+    const deviceGroups = new Map<
+      string,
+      { host: string; port: number; scanRate: number; tags: string[] }
+    >();
+    for (const eipVar of eipVariables.values()) {
+      const existing = deviceGroups.get(eipVar.deviceId);
+      const scanRate = eipVar.scanRate ?? 1000;
+      if (existing) {
+        existing.tags.push(eipVar.tag);
+        // Use fastest scan rate
+        if (scanRate < existing.scanRate) {
+          existing.scanRate = scanRate;
+        }
+      } else {
+        deviceGroups.set(eipVar.deviceId, {
+          host: eipVar.host,
+          port: eipVar.port,
+          scanRate,
+          tags: [eipVar.tag],
+        });
+      }
+    }
+
+    const attemptSubscribe = async (): Promise<boolean> => {
+      try {
+        let allSuccess = true;
+        for (const [deviceId, group] of deviceGroups) {
+          const payload = JSON.stringify({
+            deviceId,
+            host: group.host,
+            port: group.port,
+            scanRate: group.scanRate,
+            tags: group.tags,
+            subscriberId: projectId,
+          });
+          const response = await nc.request(
+            "ethernetip.subscribe",
+            new TextEncoder().encode(payload),
+            { timeout: 5000 },
+          );
+          const result = JSON.parse(
+            new TextDecoder().decode(response.data),
+          ) as { success: boolean };
+          if (result.success) {
+            log.info(
+              `Subscribed ${group.tags.length} tag(s) for device ${deviceId} (${group.host}:${group.port})`,
+            );
+          } else {
+            log.warn(`EtherNet/IP subscribe for ${deviceId} returned success=false`);
+            allSuccess = false;
+          }
+        }
+        return allSuccess;
+      } catch {
+        log.debug(
+          "EtherNet/IP subscribe request failed (scanner may not be running yet)",
+        );
+        return false;
+      }
+    };
+
+    // Try immediately, then retry every 10s if ethernetip isn't available yet
+    if (!(await attemptSubscribe())) {
+      log.info(
+        "Will retry EtherNet/IP subscribe every 10s until scanner is available",
+      );
+      eipRetryInterval = setInterval(async () => {
+        if (await attemptSubscribe()) {
+          clearInterval(eipRetryInterval!);
+          eipRetryInterval = null;
+        }
+      }, 10_000);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // OPC UA source subscriptions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Collect variables sourced from OPC UA (with connection info)
+  const opcuaVariables = new Map<
+    string,
+    { variableId: string; nodeId: string; deviceId: string; endpointUrl: string; scanRate?: number }
+  >();
+  for (const [variableId, variable] of Object.entries(variables)) {
+    if (variable.source?.opcua) {
+      opcuaVariables.set(variableId, {
+        variableId,
+        ...variable.source.opcua,
+      });
+    }
+  }
+
+  let opcuaRetryInterval: ReturnType<typeof setInterval> | null = null;
+
+  if (opcuaVariables.size > 0) {
+    log.info(
+      `Setting up OPC UA sources for ${opcuaVariables.size} variable(s)`,
+    );
+
+    // Sanitize NodeIds for NATS subjects (same as opcua scanner)
+    const sanitizeNodeId = (nodeId: string): string =>
+      nodeId.replace(/[.;=]/g, "_");
+
+    // Subscribe to data topics immediately
+    for (const [variableId, opcuaVar] of opcuaVariables) {
+      const subject = `opcua.data.${opcuaVar.deviceId}.${sanitizeNodeId(opcuaVar.nodeId)}`;
+      const abort = new AbortController();
+      const sub = nc.subscribe(subject);
+
+      subscriptions.set(subject, async () => {
+        abort.abort();
+        await sub.unsubscribe();
+      });
+
+      const handlerPromise = (async () => {
+        try {
+          for await (const msg of sub) {
+            if (abort.signal.aborted) break;
+            try {
+              const data = JSON.parse(msg.string()) as {
+                value: number | boolean | string | null;
+              };
+              if (data.value !== null && data.value !== undefined) {
+                onVariableUpdate(variableId, data.value);
+              }
+            } catch (error) {
+              log.error(
+                `Error processing OPC UA data on ${subject}:`,
+                error,
+              );
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) {
+            log.error(`Error in OPC UA subscription for ${subject}:`, error);
+          }
+        }
+      })();
+
+      handlers.set(subject, { abort, promise: handlerPromise });
+      log.debug(`Subscribed to OPC UA data: ${subject} → ${variableId}`);
+    }
+
+    // Group OPC UA variables by device for per-device subscribe requests
+    const opcuaDeviceGroups = new Map<
+      string,
+      { endpointUrl: string; scanRate: number; nodeIds: string[] }
+    >();
+    for (const opcuaVar of opcuaVariables.values()) {
+      const existing = opcuaDeviceGroups.get(opcuaVar.deviceId);
+      const scanRate = opcuaVar.scanRate ?? 1000;
+      if (existing) {
+        existing.nodeIds.push(opcuaVar.nodeId);
+        if (scanRate < existing.scanRate) {
+          existing.scanRate = scanRate;
+        }
+      } else {
+        opcuaDeviceGroups.set(opcuaVar.deviceId, {
+          endpointUrl: opcuaVar.endpointUrl,
+          scanRate,
+          nodeIds: [opcuaVar.nodeId],
+        });
+      }
+    }
+
+    const attemptOpcuaSubscribe = async (): Promise<boolean> => {
+      try {
+        let allSuccess = true;
+        for (const [deviceId, group] of opcuaDeviceGroups) {
+          const payload = JSON.stringify({
+            deviceId,
+            endpointUrl: group.endpointUrl,
+            scanRate: group.scanRate,
+            nodeIds: group.nodeIds,
+            subscriberId: projectId,
+          });
+          const response = await nc.request(
+            "opcua.subscribe",
+            new TextEncoder().encode(payload),
+            { timeout: 10_000 },
+          );
+          const result = JSON.parse(
+            new TextDecoder().decode(response.data),
+          ) as { success: boolean };
+          if (result.success) {
+            log.info(
+              `Subscribed ${group.nodeIds.length} node(s) for OPC UA device ${deviceId} (${group.endpointUrl})`,
+            );
+          } else {
+            log.warn(`OPC UA subscribe for ${deviceId} returned success=false`);
+            allSuccess = false;
+          }
+        }
+        return allSuccess;
+      } catch {
+        log.debug(
+          "OPC UA subscribe request failed (scanner may not be running yet)",
+        );
+        return false;
+      }
+    };
+
+    // Try immediately, then retry every 10s if opcua isn't available yet
+    if (!(await attemptOpcuaSubscribe())) {
+      log.info(
+        "Will retry OPC UA subscribe every 10s until scanner is available",
+      );
+      opcuaRetryInterval = setInterval(async () => {
+        if (await attemptOpcuaSubscribe()) {
+          clearInterval(opcuaRetryInterval!);
+          opcuaRetryInterval = null;
+        }
+      }, 10_000);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Modbus source subscriptions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Collect variables sourced from Modbus (with full tag addressing)
+  const modbusVariables = new Map<
+    string,
+    {
+      variableId: string;
+      tag: string;
+      deviceId: string;
+      host: string;
+      port: number;
+      unitId: number;
+      address: number;
+      functionCode: "coil" | "discrete" | "holding" | "input";
+      modbusDatatype: string;
+      byteOrder: string;
+      scanRate?: number;
+    }
+  >();
+  for (const [variableId, variable] of Object.entries(variables)) {
+    if (variable.source?.modbus) {
+      modbusVariables.set(variableId, {
+        variableId,
+        ...variable.source.modbus,
+      });
+    }
+  }
+
+  let modbusRetryInterval: ReturnType<typeof setInterval> | null = null;
+
+  if (modbusVariables.size > 0) {
+    log.info(
+      `Setting up Modbus sources for ${modbusVariables.size} variable(s)`,
+    );
+
+    // Subscribe per device to modbus.data.{deviceId} — Modbus scanner publishes
+    // PlcDataMessage there with variableId=tagId, one message per tag per scan.
+    const modbusDeviceIds = new Set(
+      [...modbusVariables.values()].map((v) => v.deviceId),
+    );
+    for (const deviceId of modbusDeviceIds) {
+      const subject = `modbus.data.${deviceId}`;
+      const abort = new AbortController();
+      const sub = nc.subscribe(subject);
+
+      subscriptions.set(subject, async () => {
+        abort.abort();
+        await sub.unsubscribe();
+      });
+
+      // Build tagId → variableId lookup for this device
+      const tagToVariable = new Map<string, string>();
+      for (const [variableId, modbusVar] of modbusVariables) {
+        if (modbusVar.deviceId === deviceId) {
+          tagToVariable.set(modbusVar.tag, variableId);
+        }
+      }
+
+      const handlerPromise = (async () => {
+        try {
+          for await (const msg of sub) {
+            if (abort.signal.aborted) break;
+            try {
+              const data = JSON.parse(msg.string()) as {
+                variableId: string;
+                value: number | boolean | null;
+              };
+              const plcVarId = tagToVariable.get(data.variableId);
+              if (plcVarId && data.value !== null && data.value !== undefined) {
+                onVariableUpdate(plcVarId, data.value);
+              }
+            } catch (error) {
+              log.error(
+                `Error processing Modbus data on ${subject}:`,
+                error,
+              );
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) {
+            log.error(`Error in Modbus subscription for ${subject}:`, error);
+          }
+        }
+      })();
+
+      handlers.set(subject, { abort, promise: handlerPromise });
+      log.debug(`Subscribed to Modbus data: ${subject}`);
+    }
+
+    // Group Modbus variables by device for per-device subscribe requests
+    const modbusDeviceGroups = new Map<
+      string,
+      {
+        host: string;
+        port: number;
+        unitId: number;
+        byteOrder: string;
+        scanRate: number;
+        tags: Array<{
+          id: string;
+          address: number;
+          functionCode: "coil" | "discrete" | "holding" | "input";
+          datatype: string;
+          byteOrder: string;
+        }>;
+      }
+    >();
+    for (const modbusVar of modbusVariables.values()) {
+      const existing = modbusDeviceGroups.get(modbusVar.deviceId);
+      const scanRate = modbusVar.scanRate ?? 1000;
+      const tagEntry = {
+        id: modbusVar.tag,
+        address: modbusVar.address,
+        functionCode: modbusVar.functionCode,
+        datatype: modbusVar.modbusDatatype,
+        byteOrder: modbusVar.byteOrder,
+      };
+      if (existing) {
+        existing.tags.push(tagEntry);
+        if (scanRate < existing.scanRate) existing.scanRate = scanRate;
+      } else {
+        modbusDeviceGroups.set(modbusVar.deviceId, {
+          host: modbusVar.host,
+          port: modbusVar.port,
+          unitId: modbusVar.unitId,
+          byteOrder: modbusVar.byteOrder,
+          scanRate,
+          tags: [tagEntry],
+        });
+      }
+    }
+
+    const attemptModbusSubscribe = async (): Promise<boolean> => {
+      try {
+        let allSuccess = true;
+        for (const [deviceId, group] of modbusDeviceGroups) {
+          const payload = JSON.stringify({
+            deviceId,
+            host: group.host,
+            port: group.port,
+            unitId: group.unitId,
+            byteOrder: group.byteOrder,
+            scanRate: group.scanRate,
+            tags: group.tags,
+            subscriberId: projectId,
+          });
+          const response = await nc.request(
+            "modbus.subscribe",
+            new TextEncoder().encode(payload),
+            { timeout: 5000 },
+          );
+          const result = JSON.parse(
+            new TextDecoder().decode(response.data),
+          ) as { success: boolean };
+          if (result.success) {
+            log.info(
+              `Subscribed ${group.tags.length} tag(s) for Modbus device ${deviceId} (${group.host}:${group.port})`,
+            );
+          } else {
+            log.warn(`Modbus subscribe for ${deviceId} returned success=false`);
+            allSuccess = false;
+          }
+        }
+        return allSuccess;
+      } catch {
+        log.debug(
+          "Modbus subscribe request failed (scanner may not be running yet)",
+        );
+        return false;
+      }
+    };
+
+    // Try immediately, then retry every 10s if modbus isn't available yet
+    if (!(await attemptModbusSubscribe())) {
+      log.info(
+        "Will retry Modbus subscribe every 10s until scanner is available",
+      );
+      modbusRetryInterval = setInterval(async () => {
+        if (await attemptModbusSubscribe()) {
+          clearInterval(modbusRetryInterval!);
+          modbusRetryInterval = null;
+        }
+      }, 10_000);
+    }
+  }
+
   // Helper function to publish all variables
   const publishAllVariables = async (
     publishFn: NatsManager["publish"],
@@ -275,7 +897,14 @@ export async function setupNats(
       value: finalValue,
       timestamp: Date.now(),
       datatype,
+      deadband: variable?.deadband,
+      disableRBE: variable?.disableRBE,
     };
+
+    // Include udtTemplate if this UDT variable has a Sparkplug B template definition
+    if (datatype === "udt" && variable && "udtTemplate" in variable && variable.udtTemplate) {
+      (schemaMessage as Record<string, unknown>).udtTemplate = variable.udtTemplate;
+    }
 
     if (!isPlcDataMessage(schemaMessage)) {
       throw new Error(`Invalid PLC message: ${JSON.stringify(schemaMessage)}`);
@@ -324,6 +953,118 @@ export async function setupNats(
     },
 
     disconnect: async () => {
+      // Stop heartbeat publishing
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+      if (heartbeatsKv) {
+        try {
+          await heartbeatsKv.delete(projectId);
+          log.info("Removed service heartbeat");
+        } catch {
+          // Ignore - may already be expired
+        }
+      }
+
+      // Clean up EtherNet/IP retry and unsubscribe
+      if (eipRetryInterval) {
+        clearInterval(eipRetryInterval);
+        eipRetryInterval = null;
+      }
+      if (eipVariables.size > 0) {
+        // Group tags by device for per-device unsubscribe
+        const unsubGroups = new Map<string, string[]>();
+        for (const eipVar of eipVariables.values()) {
+          const existing = unsubGroups.get(eipVar.deviceId);
+          if (existing) {
+            existing.push(eipVar.tag);
+          } else {
+            unsubGroups.set(eipVar.deviceId, [eipVar.tag]);
+          }
+        }
+        for (const [deviceId, tags] of unsubGroups) {
+          try {
+            await nc.request(
+              "ethernetip.unsubscribe",
+              new TextEncoder().encode(
+                JSON.stringify({ deviceId, tags, subscriberId: projectId }),
+              ),
+              { timeout: 2000 },
+            );
+            log.info(`Unsubscribed ${tags.length} tags from device ${deviceId}`);
+          } catch {
+            // Best-effort — ethernetip may already be down
+          }
+        }
+      }
+
+      // Clean up OPC UA retry and unsubscribe
+      if (opcuaRetryInterval) {
+        clearInterval(opcuaRetryInterval);
+        opcuaRetryInterval = null;
+      }
+      if (opcuaVariables.size > 0) {
+        const unsubGroups = new Map<string, string[]>();
+        for (const opcuaVar of opcuaVariables.values()) {
+          const existing = unsubGroups.get(opcuaVar.deviceId);
+          if (existing) {
+            existing.push(opcuaVar.nodeId);
+          } else {
+            unsubGroups.set(opcuaVar.deviceId, [opcuaVar.nodeId]);
+          }
+        }
+        for (const [deviceId, nodeIds] of unsubGroups) {
+          try {
+            await nc.request(
+              "opcua.unsubscribe",
+              new TextEncoder().encode(
+                JSON.stringify({ deviceId, nodeIds, subscriberId: projectId }),
+              ),
+              { timeout: 2000 },
+            );
+            log.info(`Unsubscribed ${nodeIds.length} node(s) from OPC UA device ${deviceId}`);
+          } catch {
+            // Best-effort — opcua scanner may already be down
+          }
+        }
+      }
+
+      // Clean up Modbus retry and unsubscribe
+      if (modbusRetryInterval) {
+        clearInterval(modbusRetryInterval);
+        modbusRetryInterval = null;
+      }
+      if (modbusVariables.size > 0) {
+        const unsubGroups = new Map<string, string[]>();
+        for (const modbusVar of modbusVariables.values()) {
+          const existing = unsubGroups.get(modbusVar.deviceId);
+          if (existing) {
+            existing.push(modbusVar.tag);
+          } else {
+            unsubGroups.set(modbusVar.deviceId, [modbusVar.tag]);
+          }
+        }
+        for (const [deviceId, tagIds] of unsubGroups) {
+          try {
+            await nc.request(
+              "modbus.unsubscribe",
+              new TextEncoder().encode(
+                JSON.stringify({ deviceId, tagIds, subscriberId: projectId }),
+              ),
+              { timeout: 2000 },
+            );
+            log.info(`Unsubscribed ${tagIds.length} tag(s) from Modbus device ${deviceId}`);
+          } catch {
+            // Best-effort — modbus scanner may already be down
+          }
+        }
+      }
+
+      // Stop shutdown listener
+      shutdownAbort.abort();
+      await shutdownSub.unsubscribe();
+
       // Signal all handlers to stop
       for (const handler of handlers.values()) {
         handler.abort.abort();

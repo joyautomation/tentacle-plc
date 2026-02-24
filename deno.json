@@ -1,6 +1,6 @@
 {
   "name": "@joyautomation/tentacle-plc",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "license": "MIT",
   "exports": "./mod.ts",
   "tasks": {
@@ -13,6 +13,7 @@
     "@nats-io/nats-core": "jsr:@nats-io/nats-core@3.3",
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
+    "@nats-io/kv": "jsr:@nats-io/kv@3",
     "@joyautomation/nats-schema": "jsr:@joyautomation/tentacle-nats-schema@^0.0.1"
   }
 }
