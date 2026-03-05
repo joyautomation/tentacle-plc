@@ -863,8 +863,8 @@ export async function setupNats(
   };
 
   // Subscribe to variable report requests
-  const requestSubject = substituteTopic(NATS_TOPICS.plc.variablesRequest, {
-    projectId,
+  const requestSubject = substituteTopic(NATS_TOPICS.module.variables, {
+    moduleId: projectId,
   });
   const requestSub = nc.subscribe(requestSubject);
   const requestAbort = new AbortController();
@@ -891,7 +891,7 @@ export async function setupNats(
 
     // Create schema-compliant message
     const schemaMessage: PlcDataMessage = {
-      projectId,
+      moduleId: projectId,
       deviceId: projectId, // For tentacle-plc runtime, use projectId as deviceId
       variableId,
       value: finalValue,
@@ -911,8 +911,8 @@ export async function setupNats(
     }
 
     // Publish to schema topic
-    const schemaSubject = substituteTopic(NATS_TOPICS.plc.data, {
-      projectId,
+    const schemaSubject = substituteTopic(NATS_TOPICS.module.data, {
+      moduleId: projectId,
       variableId,
     });
 
