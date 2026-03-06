@@ -1,7 +1,7 @@
 {
   "name": "@joyautomation/tentacle-plc",
   "version": "0.0.9",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "exports": {
     ".": "./mod.ts",
     "./codegen": "./codegen.ts"
