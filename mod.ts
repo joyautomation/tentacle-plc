@@ -94,6 +94,35 @@ export type { OpcUaDevice, OpcUaSource } from "./opcua.ts";
 export { modbusTag } from "./modbus.ts";
 export type { ModbusDevice, ModbusSource } from "./modbus.ts";
 
+// Ladder logic DSL
+export {
+  createLadderProgram,
+  NO,
+  NC,
+  OTE,
+  OTL,
+  OTU,
+  TON,
+  TOF,
+  CTU,
+  CTD,
+  branch,
+  series,
+  RES,
+} from "./ladder.ts";
+export type {
+  LadderContact,
+  LadderSeries,
+  LadderBranch,
+  LadderCondition,
+  LadderCoil,
+  LadderTimer,
+  LadderCounter,
+  LadderOutput,
+  LadderElement,
+  RungDefinition,
+} from "./ladder.ts";
+
 // NATS utilities (for advanced usage)
 export { parseValue } from "./nats.ts";
 export type { NatsManager } from "./nats.ts";

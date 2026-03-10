@@ -123,12 +123,14 @@ export async function generateEipTypes(
     for (const device of devices) {
       const port = device.port ?? 44818;
 
-      // Send browse request with connection info
+      // Send synchronous browse request — returns results directly in the reply.
+      // Async mode publishes progress but discards results, so ethernetip.variables
+      // returns nothing. Sync mode waits for the full browse and returns the
+      // VariableInfo[] in the NATS response.
       const browsePayload = JSON.stringify({
         deviceId: device.id,
         host: device.host,
         port,
-        async: true,
       });
 
       console.log(`  Browsing ${device.id} (${device.host}:${port})...`);
@@ -136,72 +138,11 @@ export async function generateEipTypes(
       const browseResponse = await nc.request(
         "ethernetip.browse",
         new TextEncoder().encode(browsePayload),
-        { timeout: 10_000 },
-      );
-
-      const { browseId } = JSON.parse(
-        new TextDecoder().decode(browseResponse.data),
-      ) as { browseId: string };
-
-      // Subscribe to progress updates for this browse
-      const progressSubject = `ethernetip.browse.progress.${browseId}`;
-      const progressSub = nc.subscribe(progressSubject);
-
-      let completed = false;
-      let failed = false;
-      let failMessage = "";
-
-      const timeoutId = setTimeout(() => {
-        if (!completed && !failed) {
-          failed = true;
-          failMessage = `Browse of ${device.id} timed out after ${timeout / 1000}s`;
-          progressSub.unsubscribe();
-        }
-      }, timeout);
-
-      for await (const msg of progressSub) {
-        const progress = JSON.parse(msg.string()) as BrowseProgressMessage;
-
-        if (progress.message) {
-          console.log(`  [${device.id}:${progress.phase}] ${progress.message}`);
-        }
-
-        // Single-device browse completes when device itself or _all is done
-        if (
-          progress.phase === "completed" &&
-          (progress.deviceId === device.id || progress.deviceId === "_all")
-        ) {
-          completed = true;
-          clearTimeout(timeoutId);
-          progressSub.unsubscribe();
-          break;
-        }
-
-        if (
-          progress.phase === "failed" &&
-          (progress.deviceId === device.id || progress.deviceId === "_all")
-        ) {
-          failed = true;
-          failMessage = progress.message || `Browse of ${device.id} failed`;
-          clearTimeout(timeoutId);
-          progressSub.unsubscribe();
-          break;
-        }
-      }
-
-      if (failed) {
-        throw new Error(failMessage);
-      }
-
-      // Fetch variables for this device
-      const varsResponse = await nc.request(
-        "ethernetip.variables",
-        new TextEncoder().encode(JSON.stringify({ plcId: device.id })),
-        { timeout: 10_000 },
+        { timeout },
       );
 
       const variables = JSON.parse(
-        new TextDecoder().decode(varsResponse.data),
+        new TextDecoder().decode(browseResponse.data),
       ) as VariableInfo[];
 
       const tags = new Map<string, string>();
