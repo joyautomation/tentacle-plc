@@ -87,6 +87,48 @@ export async function createPlc<V extends PlcVariablesConfig>(
   // Deferred publish — assigned after setupNats returns
   let natsPublish: NatsManager["publish"] | null = null;
 
+  // UDT member update: debounce and publish parent UDT once per batch.
+  const pendingUdtPublish = new Set<string>();
+  let udtPublishTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const flushUdtPublishes = () => {
+    udtPublishTimer = null;
+    for (const udtVarId of pendingUdtPublish) {
+      const udtVar = runtime.variables[udtVarId as keyof V] as PlcVariable | undefined;
+      if (udtVar && udtVar.datatype === "udt") {
+        natsPublish?.(udtVarId, udtVar.value, "udt").catch((err) => {
+          log.error(`Failed to publish UDT ${udtVarId}:`, err);
+        });
+      }
+    }
+    pendingUdtPublish.clear();
+  };
+
+  /** Set a value at a dotted path (e.g., "timer.ACC") in a nested object */
+  const setNestedValue = (obj: Record<string, unknown>, path: string, value: unknown) => {
+    const parts = path.split(".");
+    let current = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (typeof current[parts[i]] !== "object" || current[parts[i]] === null) {
+        current[parts[i]] = {};
+      }
+      current = current[parts[i]] as Record<string, unknown>;
+    }
+    current[parts[parts.length - 1]] = value;
+  };
+
+  /** Called by nats.ts when a UDT member's EIP data arrives */
+  const handleUdtMemberUpdate = (udtVarId: string, memberPath: string, value: number | boolean | string) => {
+    const udtVar = runtime.variables[udtVarId as keyof V] as PlcVariable | undefined;
+    if (udtVar && udtVar.datatype === "udt" && typeof udtVar.value === "object" && udtVar.value !== null) {
+      setNestedValue(udtVar.value as Record<string, unknown>, memberPath, value);
+      pendingUdtPublish.add(udtVarId);
+      if (!udtPublishTimer) {
+        udtPublishTimer = setTimeout(flushUdtPublishes, 0);
+      }
+    }
+  };
+
   // Setup NATS connection (with shutdown callback)
   const natsManager = await setupNats(
     config.nats,
@@ -96,18 +138,25 @@ export async function createPlc<V extends PlcVariablesConfig>(
       // Handle incoming variable updates (from EIP, NATS sources, etc.)
       const variable = runtime.variables[variableId as keyof V];
       if (variable) {
+        const v = variable as PlcVariable;
+        // Skip if value hasn't actually changed (RBE at PLC level)
+        if (v.value === value) return;
+        if (typeof value === "object" && value !== null &&
+            typeof v.value === "object" && v.value !== null &&
+            JSON.stringify(v.value) === JSON.stringify(value)) return;
         log.debug(`[NATS] ${String(variableId)} <- ${value}`);
-        (variable as PlcVariable).value = value;
+        v.value = value as PlcVariable["value"];
         // Re-publish so downstream services (MQTT, etc.) see the update
         natsPublish?.(
           variableId,
           value,
-          (variable as PlcVariable).datatype,
+          v.datatype,
         ).catch((err) => {
           log.error(`Failed to re-publish ${String(variableId)}:`, err);
         });
       }
     },
+    handleUdtMemberUpdate,
     async () => {
       // Shutdown callback — triggered when shutdown command received via NATS
       if (stopFn) {
@@ -164,6 +213,7 @@ export async function createPlc<V extends PlcVariablesConfig>(
   runtime.running = true;
 
   // Publish initial values for all variables so downstream services know about them
+  // Skip UDT members — they're represented inside their parent UDT template
   log.info("Publishing initial variable values...");
   for (const [variableId, variable] of Object.entries(runtime.variables)) {
     const v = variable as PlcVariable;
@@ -178,6 +228,12 @@ export async function createPlc<V extends PlcVariablesConfig>(
   const stop = async () => {
     log.info("Stopping PLC...");
     runtime.running = false;
+
+    // Cancel pending UDT debounce
+    if (udtPublishTimer) {
+      clearTimeout(udtPublishTimer);
+      udtPublishTimer = null;
+    }
 
     // Stop all tasks
     for (const [taskId, interval] of runtime.taskIntervals) {

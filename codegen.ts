@@ -49,9 +49,31 @@ type VariableInfo = {
   variableId: string;
   value: number | boolean | string | null;
   datatype: string;
+  cipType?: string;
   quality: string;
   origin: string;
   lastUpdated: number;
+};
+
+/** UDT member from browse response */
+type UdtMemberExport = {
+  name: string;
+  datatype: string;
+  udtType?: string;
+  isArray: boolean;
+};
+
+/** UDT template from browse response */
+type UdtExport = {
+  name: string;
+  members: UdtMemberExport[];
+};
+
+/** Browse result with UDT info */
+type BrowseResult = {
+  variables: VariableInfo[];
+  udts: Record<string, UdtExport>;
+  structTags: Record<string, string>;
 };
 
 /** Browse progress message from ethernetip */
@@ -89,6 +111,68 @@ export type GenerateEipTypesOptions = {
   timeout?: number;
 };
 
+/** Map EIP PLC datatypes to TypeScript types */
+function eipToTsType(datatype: string): string {
+  switch (datatype) {
+    case "BOOL":
+      return "boolean";
+    case "SINT": case "INT": case "DINT": case "LINT":
+    case "USINT": case "UINT": case "UDINT": case "ULINT":
+    case "REAL": case "LREAL":
+      return "number";
+    case "STRING":
+      return "string";
+    case "STRUCT":
+      // Struct member whose UDT type couldn't be resolved (e.g. Rockwell built-in
+      // TIMER, COUNTER, CONTROL, etc.) — use Record<string, unknown>
+      return "Record<string, unknown>";
+    default:
+      // NATS datatypes from browse
+      if (datatype === "boolean") return "boolean";
+      if (datatype === "number") return "number";
+      if (datatype === "string") return "string";
+      return "Record<string, unknown>";
+  }
+}
+
+/** Map a browse member datatype to PLC variable datatype */
+function eipMemberToPlcDatatype(datatype: string): "number" | "boolean" | "string" {
+  switch (datatype) {
+    case "BOOL":
+    case "boolean":
+      return "boolean";
+    case "STRING":
+    case "string":
+      return "string";
+    case "STRUCT":
+      return "string";
+    default:
+      return "number";
+  }
+}
+
+/** Generate a TypeScript interface for a UDT, recursively resolving nested UDTs */
+function generateUdtInterface(
+  udt: UdtExport,
+  allUdts: Record<string, UdtExport>,
+  indent: string = "",
+): string[] {
+  const safeName = udt.name.replace(/[^a-zA-Z0-9_]/g, "_");
+  const lines: string[] = [];
+  lines.push(`${indent}export type ${safeName} = {`);
+  for (const member of udt.members) {
+    if (member.udtType && allUdts[member.udtType]) {
+      // Nested UDT — reference the generated type
+      const safeType = member.udtType.replace(/[^a-zA-Z0-9_]/g, "_");
+      lines.push(`${indent}  ${member.name}: ${safeType};`);
+    } else {
+      lines.push(`${indent}  ${member.name}: ${eipToTsType(member.datatype)};`);
+    }
+  }
+  lines.push(`${indent}};`);
+  return lines;
+}
+
 /**
  * Browse EtherNet/IP devices and generate typed device definitions.
  * Sends browse requests with connection info directly — no KV persistence needed.
@@ -118,15 +202,18 @@ export async function generateEipTypes(
   try {
     console.log(`Browsing ${devices.length} device(s)...`);
 
-    const deviceTags = new Map<string, { host: string; port: number; tags: Map<string, string> }>();
+    type DeviceBrowseData = {
+      host: string;
+      port: number;
+      tags: Map<string, string>;
+      udts: Record<string, UdtExport>;
+      structTags: Record<string, string>;
+    };
+    const deviceData = new Map<string, DeviceBrowseData>();
 
     for (const device of devices) {
       const port = device.port ?? 44818;
 
-      // Send synchronous browse request — returns results directly in the reply.
-      // Async mode publishes progress but discards results, so ethernetip.variables
-      // returns nothing. Sync mode waits for the full browse and returns the
-      // VariableInfo[] in the NATS response.
       const browsePayload = JSON.stringify({
         deviceId: device.id,
         host: device.host,
@@ -135,20 +222,79 @@ export async function generateEipTypes(
 
       console.log(`  Browsing ${device.id} (${device.host}:${port})...`);
 
+      // Start browse (always async — returns browseId immediately)
       const browseResponse = await nc.request(
         "ethernetip.browse",
         new TextEncoder().encode(browsePayload),
-        { timeout },
+        { timeout: 10_000 },
       );
-
-      const variables = JSON.parse(
+      const { browseId } = JSON.parse(
         new TextDecoder().decode(browseResponse.data),
-      ) as VariableInfo[];
+      ) as { browseId: string };
 
-      const tags = new Map<string, string>();
+      // Subscribe to progress + result topics
+      const progressSub = nc.subscribe(`ethernetip.browse.progress.${browseId}`);
+      const resultSub = nc.subscribe(`ethernetip.browse.result.${browseId}`);
+
+      let variables: VariableInfo[] = [];
+      let udts: Record<string, UdtExport> = {};
+      let structTags: Record<string, string> = {};
+      let completed = false;
+      let failed = false;
+      let failMessage = "";
+
+      const timeoutId = setTimeout(() => {
+        if (!completed && !failed) {
+          failed = true;
+          failMessage = `Browse of ${device.id} timed out after ${timeout / 1000}s`;
+          progressSub.unsubscribe();
+          resultSub.unsubscribe();
+        }
+      }, timeout);
+
+      // Print progress updates in background
+      const progressHandler = (async () => {
+        for await (const msg of progressSub) {
+          try {
+            const progress = JSON.parse(msg.string()) as BrowseProgressMessage;
+            if (progress.phase === "failed") {
+              failed = true;
+              failMessage = progress.message || "Browse failed";
+              clearTimeout(timeoutId);
+              await resultSub.unsubscribe();
+              break;
+            }
+            if (progress.message) {
+              console.log(`    [${progress.phase}] ${progress.message}`);
+            }
+          } catch { /* ignore */ }
+        }
+      })();
+
+      // Wait for result
+      for await (const msg of resultSub) {
+        const raw = JSON.parse(msg.string());
+        const result = raw as BrowseResult;
+        variables = result.variables ?? [];
+        udts = result.udts ?? {};
+        structTags = result.structTags ?? {};
+        completed = true;
+        clearTimeout(timeoutId);
+        await progressSub.unsubscribe();
+        await resultSub.unsubscribe();
+        break;
+      }
+
+      await progressHandler.catch(() => {});
+
+      if (failed) {
+        throw new Error(failMessage);
+      }
+
+      const tags = new Map<string, { datatype: string; cipType: string }>();
       for (const v of variables) {
         if (v.deviceId === device.id) {
-          tags.set(v.variableId, v.datatype);
+          tags.set(v.variableId, { datatype: v.datatype, cipType: v.cipType ?? "" });
         }
       }
 
@@ -158,10 +304,16 @@ export async function generateEipTypes(
         );
       }
 
-      deviceTags.set(device.id, { host: device.host, port, tags });
+      const udtCount = Object.keys(udts).length;
+      const structCount = Object.keys(structTags).length;
+      if (udtCount > 0) {
+        console.log(`  Found ${udtCount} UDT type(s), ${structCount} struct tag(s)`);
+      }
+
+      deviceData.set(device.id, { host: device.host, port, tags, udts, structTags });
     }
 
-    const totalTags = [...deviceTags.values()].reduce(
+    const totalTags = [...deviceData.values()].reduce(
       (sum, d) => sum + d.tags.size,
       0,
     );
@@ -179,7 +331,76 @@ export async function generateEipTypes(
       "",
     ];
 
-    for (const [deviceId, deviceInfo] of deviceTags) {
+    // Collect all unique UDTs across devices and generate type definitions
+    const allUdts: Record<string, UdtExport> = {};
+    for (const data of deviceData.values()) {
+      for (const [name, udt] of Object.entries(data.udts)) {
+        allUdts[name] = udt;
+      }
+    }
+
+    // Build set of readable members per UDT type by checking which members
+    // have actual readable tags in the browse result. This filters out array
+    // members and any other internal/system members the PLC exposes in metadata
+    // but doesn't allow reading.
+    const readableMembersByUdt = new Map<string, Set<string>>();
+    for (const data of deviceData.values()) {
+      const allTags = data.tags;
+      for (const [structTag, udtName] of Object.entries(data.structTags)) {
+        if (!readableMembersByUdt.has(udtName)) {
+          readableMembersByUdt.set(udtName, new Set());
+        }
+        const readable = readableMembersByUdt.get(udtName)!;
+        const udt = allUdts[udtName];
+        if (!udt) continue;
+        for (const member of udt.members) {
+          const memberTag = `${structTag}.${member.name}`;
+          if (allTags.has(memberTag)) {
+            // Direct atomic member is readable
+            readable.add(member.name);
+          } else if (member.udtType && allUdts[member.udtType]) {
+            // Nested UDT — check if ANY of its sub-members are readable
+            const nestedUdt = allUdts[member.udtType];
+            const hasReadableChild = nestedUdt.members.some(
+              (sub) => allTags.has(`${memberTag}.${sub.name}`),
+            );
+            if (hasReadableChild) readable.add(member.name);
+          }
+        }
+      }
+    }
+
+    // Filter UDT members to only readable ones
+    for (const [udtName, udt] of Object.entries(allUdts)) {
+      const readable = readableMembersByUdt.get(udtName);
+      if (readable && readable.size > 0) {
+        udt.members = udt.members.filter((m) => readable.has(m.name));
+      }
+      // Also filter nested UDTs recursively (they may have been used transitively)
+    }
+
+    if (Object.keys(allUdts).length > 0) {
+      lines.push("// ═══════════════════════════════════════════════════════════");
+      lines.push("// UDT Type Definitions");
+      lines.push("// ═══════════════════════════════════════════════════════════");
+      lines.push("");
+
+      // Sort UDTs for deterministic output
+      const sortedUdtNames = Object.keys(allUdts).sort();
+      for (const name of sortedUdtNames) {
+        const udt = allUdts[name];
+        const udtLines = generateUdtInterface(udt, allUdts);
+        lines.push(...udtLines);
+        lines.push("");
+      }
+    }
+
+    lines.push("// ═══════════════════════════════════════════════════════════");
+    lines.push("// Device Definitions");
+    lines.push("// ═══════════════════════════════════════════════════════════");
+    lines.push("");
+
+    for (const [deviceId, deviceInfo] of deviceData) {
       const safeId = deviceId.replace(/[^a-zA-Z0-9_]/g, "_");
       lines.push(`export const ${safeId} = {`);
       lines.push(`  id: ${JSON.stringify(deviceId)},`);
@@ -192,14 +413,80 @@ export async function generateEipTypes(
         a[0].localeCompare(b[0]),
       );
 
-      for (const [tagName, datatype] of sortedTags) {
+      for (const [tagName, tagInfo] of sortedTags) {
+        const parts = [`datatype: ${JSON.stringify(tagInfo.datatype)}`];
+        if (tagInfo.cipType) {
+          parts.push(`cipType: ${JSON.stringify(tagInfo.cipType)}`);
+        }
         lines.push(
-          `    ${JSON.stringify(tagName)}: { datatype: ${JSON.stringify(datatype)} },`,
+          `    ${JSON.stringify(tagName)}: { ${parts.join(", ")} },`,
         );
       }
 
       lines.push(`  },`);
+
+      // Add structTags mapping if there are any
+      if (Object.keys(deviceInfo.structTags).length > 0) {
+        lines.push(`  structTags: {`);
+        const sortedStructTags = Object.entries(deviceInfo.structTags).sort((a, b) =>
+          a[0].localeCompare(b[0]),
+        );
+        for (const [tagName, udtName] of sortedStructTags) {
+          lines.push(
+            `    ${JSON.stringify(tagName)}: ${JSON.stringify(udtName)},`,
+          );
+        }
+        lines.push(`  },`);
+      }
+
       lines.push(`} as const;`);
+      lines.push("");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Generate UDT template definitions (for Sparkplug B)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    if (Object.keys(allUdts).length > 0) {
+      lines.push("// ═══════════════════════════════════════════════════════════");
+      lines.push("// UDT Template Definitions (for Sparkplug B)");
+      lines.push("// ═══════════════════════════════════════════════════════════");
+      lines.push("");
+
+      const sortedUdtNames = Object.keys(allUdts).sort();
+      for (const name of sortedUdtNames) {
+        const udt = allUdts[name];
+        const safeName = name.replace(/[^a-zA-Z0-9_]/g, "_");
+        lines.push(`export const ${safeName}Template = {`);
+        lines.push(`  name: ${JSON.stringify(name)},`);
+        lines.push(`  version: "1.0",`);
+        lines.push(`  members: [`);
+        for (const member of udt.members) {
+          const memberDatatype = member.udtType && allUdts[member.udtType]
+            ? "string"
+            : eipMemberToPlcDatatype(member.datatype);
+          const parts = [
+            `name: ${JSON.stringify(member.name)}`,
+            `datatype: ${JSON.stringify(memberDatatype)}`,
+          ];
+          if (member.udtType && allUdts[member.udtType]) {
+            parts.push(`templateRef: ${JSON.stringify(member.udtType)}`);
+          }
+          lines.push(`    { ${parts.join(", ")} },`);
+        }
+        lines.push(`  ],`);
+        lines.push(`} as const;`);
+        lines.push("");
+      }
+
+      // Generate udtTemplates map: UDT name → template constant
+      lines.push("/** Map of UDT type names to their template definitions (pass to eipAll/eipUdtVars) */");
+      lines.push("export const udtTemplates = {");
+      for (const name of sortedUdtNames) {
+        const safeName = name.replace(/[^a-zA-Z0-9_]/g, "_");
+        lines.push(`  ${JSON.stringify(name)}: ${safeName}Template,`);
+      }
+      lines.push("} as const;");
       lines.push("");
     }
 
@@ -214,7 +501,7 @@ export async function generateEipTypes(
     await Deno.writeTextFile(outputPath, lines.join("\n"));
 
     console.log(
-      `Generated ${outputPath} with ${deviceTags.size} device(s) and ${totalTags} tag(s)`,
+      `Generated ${outputPath} with ${deviceData.size} device(s), ${totalTags} tag(s), and ${Object.keys(allUdts).length} UDT type(s)`,
     );
   } finally {
     await nc.close();

@@ -22,7 +22,7 @@ export type VariableSource = {
   /** Transform outgoing values before publishing */
   onSend?: (value: number | boolean | string) => number | boolean | string;
   /** EtherNet/IP tag source — subscribes to ethernetip scanner for this tag */
-  ethernetip?: { deviceId: string; host: string; port: number; tag: string; scanRate?: number };
+  ethernetip?: { deviceId: string; host: string; port: number; tag: string; cipType?: string; scanRate?: number };
   /** OPC UA node source — subscribes to opcua scanner for this node */
   opcua?: { deviceId: string; endpointUrl: string; nodeId: string; scanRate?: number };
   /** Modbus tag source — subscribes to modbus scanner for this tag */
@@ -86,10 +86,14 @@ export type UdtTemplateDefinition = {
   /** Template type name used as templateRef in Sparkplug B (e.g. "MotorDrive") */
   name: string;
   version?: string;
-  members: Array<{
-    name: string;
-    datatype: "number" | "boolean" | "string";
-    description?: string;
+  members: ReadonlyArray<{
+    readonly name: string;
+    readonly datatype: "number" | "boolean" | "string";
+    readonly description?: string;
+    /** For nested struct members: reference to another UDT template by name */
+    readonly templateRef?: string;
+    /** For array members */
+    readonly isArray?: boolean;
   }>;
 };
 
@@ -99,6 +103,10 @@ export type PlcVariableUdtConfig<T = Record<string, unknown>> = PlcVariableConfi
   /** Optional Sparkplug B template definition. When set, tentacle-mqtt publishes
    *  this variable as a Template Instance rather than a JSON-stringified string. */
   udtTemplate?: UdtTemplateDefinition;
+  /** Per-member variable sources keyed by dotted member path (e.g., "AUTOCMD", "timer.ACC").
+   *  Each member source drives an individual scanner subscription. The PLC runtime
+   *  routes incoming member data into this UDT's value object at the corresponding path. */
+  memberSources?: Record<string, VariableSource>;
 };
 
 export type PlcVariableConfig =
@@ -153,7 +161,9 @@ export type PlcVariablesRuntime<V extends PlcVariablesConfig> = {
         ? PlcVariableString
         : V[K] extends PlcVariableUdtConfig<infer T>
           ? PlcVariableUdt<T>
-          : never;
+          : V[K] extends PlcVariableConfig
+            ? PlcVariable
+            : never;
 };
 
 // =============================================================================

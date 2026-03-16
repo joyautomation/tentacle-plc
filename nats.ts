@@ -159,6 +159,11 @@ export async function setupNats(
     variableId: string,
     value: number | boolean | string | Record<string, unknown>,
   ) => void,
+  onUdtMemberUpdate?: (
+    udtVarId: string,
+    memberPath: string,
+    value: number | boolean | string,
+  ) => void,
   onShutdown?: () => Promise<void>,
 ): Promise<NatsManager> {
   const nc = await connect({
@@ -239,6 +244,65 @@ export async function setupNats(
 
   log.info(`Listening for shutdown on: ${shutdownSubject}`);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Variables request/reply handler — returns all PLC runtime variables
+  // ═══════════════════════════════════════════════════════════════════════════
+  const variablesSubject = `${projectId}.variables`;
+  const variablesSub = nc.subscribe(variablesSubject);
+  const variablesAbort = new AbortController();
+
+  (async () => {
+    try {
+      for await (const msg of variablesSub) {
+        if (variablesAbort.signal.aborted) break;
+        // Build a lookup of base variable name → UDT template name
+        const udtTypeByBase = new Map<string, string>();
+        for (const [vid, variable] of Object.entries(variables)) {
+          if (variable.datatype === "udt" && "udtTemplate" in variable && (variable as Record<string, unknown>).udtTemplate) {
+            udtTypeByBase.set(vid, ((variable as Record<string, unknown>).udtTemplate as { name: string }).name);
+          }
+        }
+
+        const encoder = new TextEncoder();
+        const allVars = Object.entries(variables).map(([variableId, variable]) => {
+          const deviceId = variable.source?.ethernetip?.deviceId
+            ?? variable.source?.opcua?.deviceId
+            ?? variable.source?.modbus?.deviceId
+            ?? projectId;
+          const entry: Record<string, unknown> = {
+            moduleId: projectId,
+            deviceId,
+            variableId,
+            value: variable.value,
+            datatype: variable.datatype,
+            quality: "good",
+            origin: "plc",
+            lastUpdated: Date.now(),
+          };
+          // Include udtTemplate for UDT parent variables
+          if (variable.datatype === "udt" && "udtTemplate" in variable && (variable as Record<string, unknown>).udtTemplate) {
+            entry.udtTemplate = (variable as Record<string, unknown>).udtTemplate;
+          }
+          // For member variables (with dots), look up parent's UDT type name
+          const dotIdx = variableId.indexOf(".");
+          if (dotIdx !== -1) {
+            const baseName = variableId.substring(0, dotIdx);
+            const udtName = udtTypeByBase.get(baseName);
+            if (udtName) entry.structType = udtName;
+          }
+          return entry;
+        });
+        msg.respond(encoder.encode(JSON.stringify(allVars)));
+      }
+    } catch (error) {
+      if (!variablesAbort.signal.aborted) {
+        log.error("Error in variables handler:", error);
+      }
+    }
+  })();
+
+  log.info(`Listening for variables requests on: ${variablesSubject}`);
+
   const subscriptions = new Map<string, () => Promise<void>>();
   const handlers = new Map<string, SubscriptionHandler>();
 
@@ -251,9 +315,10 @@ export async function setupNats(
     log.warn("KV store initialization failed:", error);
   }
 
-  // Restore variable state from KV
+  // Restore variable state from KV (skip UDT variables — their values are
+  // assembled from member updates and stale KV data may have wrong types)
   for (const [variableId, variable] of Object.entries(variables)) {
-    if (kv) {
+    if (kv && variable.datatype !== "udt") {
       try {
         const kvData = await kv.get(variableId);
         if (kvData) {
@@ -313,17 +378,36 @@ export async function setupNats(
   // EtherNet/IP source subscriptions
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Collect variables sourced from EtherNet/IP (with connection info)
+  // Collect variables sourced from EtherNet/IP (with connection info).
+  // For UDT variables with memberSources, each member gets its own EIP subscription.
+  // The eipVariables key uses "udtVarId\0memberPath" for UDT members to distinguish
+  // them from standalone atomic variables.
   const eipVariables = new Map<
     string,
-    { variableId: string; tag: string; deviceId: string; host: string; port: number; scanRate?: number }
+    { variableId: string; tag: string; deviceId: string; host: string; port: number; cipType?: string; scanRate?: number }
   >();
+  // Map from EIP tag → { udtVarId, memberPath } for routing data into UDT values
+  const eipTagToUdtMember = new Map<string, { udtVarId: string; memberPath: string }>();
+
   for (const [variableId, variable] of Object.entries(variables)) {
     if (variable.source?.ethernetip) {
       eipVariables.set(variableId, {
         variableId,
         ...variable.source.ethernetip,
       });
+    }
+    // Extract member sources from UDT variables
+    if (variable.datatype === "udt" && "memberSources" in variable && variable.memberSources) {
+      for (const [memberPath, memberSource] of Object.entries(variable.memberSources as Record<string, { ethernetip?: { deviceId: string; host: string; port: number; tag: string; cipType?: string; scanRate?: number } }>)) {
+        if (memberSource.ethernetip) {
+          const memberKey = `${variableId}\0${memberPath}`;
+          eipVariables.set(memberKey, {
+            variableId: memberKey,
+            ...memberSource.ethernetip,
+          });
+          eipTagToUdtMember.set(memberSource.ethernetip.tag, { udtVarId: variableId, memberPath });
+        }
+      }
     }
   }
 
@@ -340,10 +424,15 @@ export async function setupNats(
 
     // Subscribe to data topics immediately — NATS subscriptions work before
     // ethernetip publishes, so no messages are missed.
-    for (const [variableId, eipVar] of eipVariables) {
+    for (const [, eipVar] of eipVariables) {
       const subject = `ethernetip.data.${eipVar.deviceId}.${sanitizeForSubject(eipVar.tag)}`;
+      // Skip if already subscribed (multiple UDT members can share a device subject prefix)
+      if (subscriptions.has(subject)) continue;
+
       const abort = new AbortController();
       const sub = nc.subscribe(subject);
+      // Look up whether this tag routes to a UDT member
+      const udtMapping = eipTagToUdtMember.get(eipVar.tag);
 
       subscriptions.set(subject, async () => {
         abort.abort();
@@ -359,7 +448,11 @@ export async function setupNats(
                 value: number | boolean | string | null;
               };
               if (data.value !== null && data.value !== undefined) {
-                onVariableUpdate(variableId, data.value);
+                if (udtMapping && onUdtMemberUpdate) {
+                  onUdtMemberUpdate(udtMapping.udtVarId, udtMapping.memberPath, data.value as number | boolean | string);
+                } else {
+                  onVariableUpdate(eipVar.variableId, data.value);
+                }
               }
             } catch (error) {
               log.error(
@@ -376,7 +469,7 @@ export async function setupNats(
       })();
 
       handlers.set(subject, { abort, promise: handlerPromise });
-      log.debug(`Subscribed to EIP data: ${subject} → ${variableId}`);
+      log.debug(`Subscribed to EIP data: ${subject} → ${udtMapping ? `${udtMapping.udtVarId}.${udtMapping.memberPath}` : eipVar.variableId}`);
     }
 
     // Also subscribe to batch data topics per device
@@ -414,13 +507,16 @@ export async function setupNats(
               };
               if (batch.values) {
                 for (const entry of batch.values) {
-                  const plcVarId = tagToVariable.get(entry.variableId);
-                  if (
-                    plcVarId &&
-                    entry.value !== null &&
-                    entry.value !== undefined
-                  ) {
-                    onVariableUpdate(plcVarId, entry.value);
+                  if (entry.value === null || entry.value === undefined) continue;
+                  // Check if this tag maps to a UDT member
+                  const udtMapping = eipTagToUdtMember.get(entry.variableId);
+                  if (udtMapping && onUdtMemberUpdate) {
+                    onUdtMemberUpdate(udtMapping.udtVarId, udtMapping.memberPath, entry.value as number | boolean | string);
+                  } else {
+                    const plcVarId = tagToVariable.get(entry.variableId);
+                    if (plcVarId) {
+                      onVariableUpdate(plcVarId, entry.value);
+                    }
                   }
                 }
               }
@@ -448,23 +544,43 @@ export async function setupNats(
     // Group EIP variables by device for per-device subscribe requests
     const deviceGroups = new Map<
       string,
-      { host: string; port: number; scanRate: number; tags: string[] }
+      { host: string; port: number; scanRate: number; tags: string[]; cipTypes: Record<string, string>; structTypes: Record<string, string> }
     >();
-    for (const eipVar of eipVariables.values()) {
+    // Build a lookup of base variable name → UDT template name
+    const udtTypeByBase = new Map<string, string>();
+    for (const [vid, variable] of Object.entries(variables)) {
+      if (variable.datatype === "udt" && "udtTemplate" in variable && variable.udtTemplate) {
+        udtTypeByBase.set(vid, variable.udtTemplate.name);
+      }
+    }
+
+    for (const [, eipVar] of eipVariables) {
       const existing = deviceGroups.get(eipVar.deviceId);
       const scanRate = eipVar.scanRate ?? 1000;
+      // Base tag name is the part before the first dot
+      const baseName = eipVar.tag.includes('.') ? eipVar.tag.substring(0, eipVar.tag.indexOf('.')) : eipVar.tag;
+      // Look up UDT template name from the parent variable
+      const udtName = udtTypeByBase.get(baseName);
       if (existing) {
         existing.tags.push(eipVar.tag);
+        if (eipVar.cipType) existing.cipTypes[eipVar.tag] = eipVar.cipType;
+        if (udtName) existing.structTypes[baseName] = udtName;
         // Use fastest scan rate
         if (scanRate < existing.scanRate) {
           existing.scanRate = scanRate;
         }
       } else {
+        const cipTypes: Record<string, string> = {};
+        const structTypes: Record<string, string> = {};
+        if (eipVar.cipType) cipTypes[eipVar.tag] = eipVar.cipType;
+        if (udtName) structTypes[baseName] = udtName;
         deviceGroups.set(eipVar.deviceId, {
           host: eipVar.host,
           port: eipVar.port,
           scanRate,
           tags: [eipVar.tag],
+          cipTypes,
+          structTypes,
         });
       }
     }
@@ -479,6 +595,8 @@ export async function setupNats(
             port: group.port,
             scanRate: group.scanRate,
             tags: group.tags,
+            cipTypes: Object.keys(group.cipTypes).length > 0 ? group.cipTypes : undefined,
+            structTypes: Object.keys(group.structTypes).length > 0 ? group.structTypes : undefined,
             subscriberId: projectId,
           });
           const response = await nc.request(
@@ -862,17 +980,8 @@ export async function setupNats(
     log.info(`Published ${Object.keys(variables).length} variables`);
   };
 
-  // Subscribe to variable report requests
-  const requestSubject = substituteTopic(NATS_TOPICS.module.variables, {
-    moduleId: projectId,
-  });
-  const requestSub = nc.subscribe(requestSubject);
-  const requestAbort = new AbortController();
-
-  subscriptions.set(requestSubject, async () => {
-    requestAbort.abort();
-    await requestSub.unsubscribe();
-  });
+  // Note: variable report requests are handled by variablesSub (set up earlier)
+  // No separate subscription needed here — variablesSub responds via msg.respond()
 
   // Create the publish function first so it can be used by publishAll
   const publish = async (
@@ -1086,22 +1195,7 @@ export async function setupNats(
     },
   };
 
-  // Handle variable report requests
-  (async () => {
-    try {
-      for await (const msg of requestSub) {
-        if (requestAbort.signal.aborted) break;
-        log.info(`Received variables request from ${msg.subject}`);
-        await manager.publishAll();
-      }
-    } catch (error) {
-      if (!requestAbort.signal.aborted) {
-        log.error("Error in variables request handler:", error);
-      }
-    }
-  })();
-
-  log.info(`Listening for variable requests on: ${requestSubject}`);
+  // Variable report requests are handled by variablesSub (set up earlier in this function)
 
   return manager;
 }

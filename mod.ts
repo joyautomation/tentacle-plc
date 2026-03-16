@@ -60,6 +60,7 @@ export type {
   PlcVariablesRuntime,
   VariableSource,
   DeadBandConfig,
+  UdtTemplateDefinition,
   NatsConfig,
 } from "./types/variables.ts";
 
@@ -83,8 +84,8 @@ export {
 } from "./types/variables.ts";
 
 // EtherNet/IP source helpers
-export { eipTag } from "./ethernetip.ts";
-export type { EipDevice, EthernetIPSource } from "./ethernetip.ts";
+export { eipTag, eipVar, eipUdtVar, eipVars, eipUdtVars, eipAll } from "./ethernetip.ts";
+export type { EipDevice, EthernetIPSource, UdtTemplateMap } from "./ethernetip.ts";
 
 // OPC UA source helpers
 export { opcuaTag } from "./opcua.ts";
