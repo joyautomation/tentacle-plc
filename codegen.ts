@@ -205,7 +205,7 @@ export async function generateEipTypes(
     type DeviceBrowseData = {
       host: string;
       port: number;
-      tags: Map<string, string>;
+      tags: Map<string, { datatype: string; cipType: string }>;
       udts: Record<string, UdtExport>;
       structTags: Record<string, string>;
     };
@@ -214,27 +214,30 @@ export async function generateEipTypes(
     for (const device of devices) {
       const port = device.port ?? 44818;
 
+      // Generate browseId client-side so we can subscribe before sending
+      // the request — avoids a race where the scanner publishes the result
+      // before our subscription is active.
+      const browseId = crypto.randomUUID();
+
       const browsePayload = JSON.stringify({
         deviceId: device.id,
         host: device.host,
         port,
+        browseId,
       });
 
       console.log(`  Browsing ${device.id} (${device.host}:${port})...`);
 
-      // Start browse (always async — returns browseId immediately)
-      const browseResponse = await nc.request(
+      // Subscribe to progress + result topics BEFORE sending the request
+      const progressSub = nc.subscribe(`ethernetip.browse.progress.${browseId}`);
+      const resultSub = nc.subscribe(`ethernetip.browse.result.${browseId}`);
+
+      // Start browse (async — returns browseId immediately)
+      await nc.request(
         "ethernetip.browse",
         new TextEncoder().encode(browsePayload),
         { timeout: 10_000 },
       );
-      const { browseId } = JSON.parse(
-        new TextDecoder().decode(browseResponse.data),
-      ) as { browseId: string };
-
-      // Subscribe to progress + result topics
-      const progressSub = nc.subscribe(`ethernetip.browse.progress.${browseId}`);
-      const resultSub = nc.subscribe(`ethernetip.browse.result.${browseId}`);
 
       let variables: VariableInfo[] = [];
       let udts: Record<string, UdtExport> = {};

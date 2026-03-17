@@ -325,7 +325,7 @@ export async function setupNats(
           const kvValue = JSON.parse(new TextDecoder().decode(kvData)) as {
             value: number | boolean | string | Record<string, unknown>;
           };
-          variable.value = kvValue.value;
+          variable.value = kvValue.value as string | number | boolean;
           log.debug(`Restored ${variableId} = ${JSON.stringify(kvValue.value)}`);
         }
       } catch {
@@ -1178,8 +1178,6 @@ export async function setupNats(
       for (const handler of handlers.values()) {
         handler.abort.abort();
       }
-      requestAbort.abort();
-
       // Unsubscribe
       for (const unsubscribe of subscriptions.values()) {
         await unsubscribe();
