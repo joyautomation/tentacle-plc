@@ -5,19 +5,19 @@
  */
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
-import { jetstream, StorageType, DiscardPolicy } from "@nats-io/jetstream";
-import { Kvm, type KV } from "@nats-io/kv";
+import { DiscardPolicy, jetstream, StorageType } from "@nats-io/jetstream";
+import { type KV, Kvm } from "@nats-io/kv";
 import type {
   NatsConfig,
   PlcVariable,
   VariableSource,
 } from "./types/variables.ts";
 import {
-  NATS_TOPICS,
-  substituteTopic,
-  type PlcDataMessage,
   isPlcDataMessage,
-} from "@joyautomation/nats-schema";
+  NATS_TOPICS,
+  type PlcDataMessage,
+  substituteTopic,
+} from "@joyautomation/tentacle-nats-schema";
 
 /** Service heartbeat entry — matches tentacle-nats-schema ServiceHeartbeat */
 interface ServiceHeartbeat {
@@ -258,40 +258,54 @@ export async function setupNats(
         // Build a lookup of base variable name → UDT template name
         const udtTypeByBase = new Map<string, string>();
         for (const [vid, variable] of Object.entries(variables)) {
-          if (variable.datatype === "udt" && "udtTemplate" in variable && (variable as Record<string, unknown>).udtTemplate) {
-            udtTypeByBase.set(vid, ((variable as Record<string, unknown>).udtTemplate as { name: string }).name);
+          if (
+            variable.datatype === "udt" && "udtTemplate" in variable &&
+            (variable as Record<string, unknown>).udtTemplate
+          ) {
+            udtTypeByBase.set(
+              vid,
+              ((variable as Record<string, unknown>).udtTemplate as {
+                name: string;
+              }).name,
+            );
           }
         }
 
         const encoder = new TextEncoder();
-        const allVars = Object.entries(variables).map(([variableId, variable]) => {
-          const deviceId = variable.source?.ethernetip?.deviceId
-            ?? variable.source?.opcua?.deviceId
-            ?? variable.source?.modbus?.deviceId
-            ?? projectId;
-          const entry: Record<string, unknown> = {
-            moduleId: projectId,
-            deviceId,
-            variableId,
-            value: variable.value,
-            datatype: variable.datatype,
-            quality: "good",
-            origin: "plc",
-            lastUpdated: Date.now(),
-          };
-          // Include udtTemplate for UDT parent variables
-          if (variable.datatype === "udt" && "udtTemplate" in variable && (variable as Record<string, unknown>).udtTemplate) {
-            entry.udtTemplate = (variable as Record<string, unknown>).udtTemplate;
-          }
-          // For member variables (with dots), look up parent's UDT type name
-          const dotIdx = variableId.indexOf(".");
-          if (dotIdx !== -1) {
-            const baseName = variableId.substring(0, dotIdx);
-            const udtName = udtTypeByBase.get(baseName);
-            if (udtName) entry.structType = udtName;
-          }
-          return entry;
-        });
+        const allVars = Object.entries(variables).map(
+          ([variableId, variable]) => {
+            const deviceId = variable.source?.ethernetip?.deviceId ??
+              variable.source?.opcua?.deviceId ??
+              variable.source?.modbus?.deviceId ??
+              projectId;
+            const entry: Record<string, unknown> = {
+              moduleId: projectId,
+              deviceId,
+              variableId,
+              value: variable.value,
+              datatype: variable.datatype,
+              quality: "good",
+              origin: "plc",
+              lastUpdated: Date.now(),
+            };
+            // Include udtTemplate for UDT parent variables
+            if (
+              variable.datatype === "udt" && "udtTemplate" in variable &&
+              (variable as Record<string, unknown>).udtTemplate
+            ) {
+              entry.udtTemplate =
+                (variable as Record<string, unknown>).udtTemplate;
+            }
+            // For member variables (with dots), look up parent's UDT type name
+            const dotIdx = variableId.indexOf(".");
+            if (dotIdx !== -1) {
+              const baseName = variableId.substring(0, dotIdx);
+              const udtName = udtTypeByBase.get(baseName);
+              if (udtName) entry.structType = udtName;
+            }
+            return entry;
+          },
+        );
         msg.respond(encoder.encode(JSON.stringify(allVars)));
       }
     } catch (error) {
@@ -326,7 +340,9 @@ export async function setupNats(
             value: number | boolean | string | Record<string, unknown>;
           };
           variable.value = kvValue.value as string | number | boolean;
-          log.debug(`Restored ${variableId} = ${JSON.stringify(kvValue.value)}`);
+          log.debug(
+            `Restored ${variableId} = ${JSON.stringify(kvValue.value)}`,
+          );
         }
       } catch {
         // No persisted state, keep default
@@ -357,7 +373,9 @@ export async function setupNats(
 
               // Apply onResponse transform if configured
               const finalValue = variable.source.onResponse
-                ? variable.source.onResponse(parsedValue as number | boolean | string)
+                ? variable.source.onResponse(
+                  parsedValue as number | boolean | string,
+                )
                 : parsedValue;
 
               onVariableUpdate(variableId, finalValue);
@@ -384,10 +402,21 @@ export async function setupNats(
   // them from standalone atomic variables.
   const eipVariables = new Map<
     string,
-    { variableId: string; tag: string; deviceId: string; host: string; port: number; cipType?: string; scanRate?: number }
+    {
+      variableId: string;
+      tag: string;
+      deviceId: string;
+      host: string;
+      port: number;
+      cipType?: string;
+      scanRate?: number;
+    }
   >();
   // Map from EIP tag → { udtVarId, memberPath } for routing data into UDT values
-  const eipTagToUdtMember = new Map<string, { udtVarId: string; memberPath: string }>();
+  const eipTagToUdtMember = new Map<
+    string,
+    { udtVarId: string; memberPath: string }
+  >();
 
   for (const [variableId, variable] of Object.entries(variables)) {
     if (variable.source?.ethernetip) {
@@ -397,15 +426,37 @@ export async function setupNats(
       });
     }
     // Extract member sources from UDT variables
-    if (variable.datatype === "udt" && "memberSources" in variable && variable.memberSources) {
-      for (const [memberPath, memberSource] of Object.entries(variable.memberSources as Record<string, { ethernetip?: { deviceId: string; host: string; port: number; tag: string; cipType?: string; scanRate?: number } }>)) {
+    if (
+      variable.datatype === "udt" && "memberSources" in variable &&
+      variable.memberSources
+    ) {
+      for (
+        const [memberPath, memberSource] of Object.entries(
+          variable.memberSources as Record<
+            string,
+            {
+              ethernetip?: {
+                deviceId: string;
+                host: string;
+                port: number;
+                tag: string;
+                cipType?: string;
+                scanRate?: number;
+              };
+            }
+          >,
+        )
+      ) {
         if (memberSource.ethernetip) {
           const memberKey = `${variableId}\0${memberPath}`;
           eipVariables.set(memberKey, {
             variableId: memberKey,
             ...memberSource.ethernetip,
           });
-          eipTagToUdtMember.set(memberSource.ethernetip.tag, { udtVarId: variableId, memberPath });
+          eipTagToUdtMember.set(memberSource.ethernetip.tag, {
+            udtVarId: variableId,
+            memberPath,
+          });
         }
       }
     }
@@ -419,13 +470,14 @@ export async function setupNats(
     );
 
     // Sanitize tag names for NATS subjects (same as ethernetip scanner)
-    const sanitizeForSubject = (tag: string): string =>
-      tag.replace(/\./g, "_");
+    const sanitizeForSubject = (tag: string): string => tag.replace(/\./g, "_");
 
     // Subscribe to data topics immediately — NATS subscriptions work before
     // ethernetip publishes, so no messages are missed.
     for (const [, eipVar] of eipVariables) {
-      const subject = `ethernetip.data.${eipVar.deviceId}.${sanitizeForSubject(eipVar.tag)}`;
+      const subject = `ethernetip.data.${eipVar.deviceId}.${
+        sanitizeForSubject(eipVar.tag)
+      }`;
       // Skip if already subscribed (multiple UDT members can share a device subject prefix)
       if (subscriptions.has(subject)) continue;
 
@@ -449,7 +501,11 @@ export async function setupNats(
               };
               if (data.value !== null && data.value !== undefined) {
                 if (udtMapping && onUdtMemberUpdate) {
-                  onUdtMemberUpdate(udtMapping.udtVarId, udtMapping.memberPath, data.value as number | boolean | string);
+                  onUdtMemberUpdate(
+                    udtMapping.udtVarId,
+                    udtMapping.memberPath,
+                    data.value as number | boolean | string,
+                  );
                 } else {
                   onVariableUpdate(eipVar.variableId, data.value);
                 }
@@ -469,7 +525,13 @@ export async function setupNats(
       })();
 
       handlers.set(subject, { abort, promise: handlerPromise });
-      log.debug(`Subscribed to EIP data: ${subject} → ${udtMapping ? `${udtMapping.udtVarId}.${udtMapping.memberPath}` : eipVar.variableId}`);
+      log.debug(
+        `Subscribed to EIP data: ${subject} → ${
+          udtMapping
+            ? `${udtMapping.udtVarId}.${udtMapping.memberPath}`
+            : eipVar.variableId
+        }`,
+      );
     }
 
     // Also subscribe to batch data topics per device
@@ -507,11 +569,17 @@ export async function setupNats(
               };
               if (batch.values) {
                 for (const entry of batch.values) {
-                  if (entry.value === null || entry.value === undefined) continue;
+                  if (entry.value === null || entry.value === undefined) {
+                    continue;
+                  }
                   // Check if this tag maps to a UDT member
                   const udtMapping = eipTagToUdtMember.get(entry.variableId);
                   if (udtMapping && onUdtMemberUpdate) {
-                    onUdtMemberUpdate(udtMapping.udtVarId, udtMapping.memberPath, entry.value as number | boolean | string);
+                    onUdtMemberUpdate(
+                      udtMapping.udtVarId,
+                      udtMapping.memberPath,
+                      entry.value as number | boolean | string,
+                    );
                   } else {
                     const plcVarId = tagToVariable.get(entry.variableId);
                     if (plcVarId) {
@@ -544,12 +612,22 @@ export async function setupNats(
     // Group EIP variables by device for per-device subscribe requests
     const deviceGroups = new Map<
       string,
-      { host: string; port: number; scanRate: number; tags: string[]; cipTypes: Record<string, string>; structTypes: Record<string, string> }
+      {
+        host: string;
+        port: number;
+        scanRate: number;
+        tags: string[];
+        cipTypes: Record<string, string>;
+        structTypes: Record<string, string>;
+      }
     >();
     // Build a lookup of base variable name → UDT template name
     const udtTypeByBase = new Map<string, string>();
     for (const [vid, variable] of Object.entries(variables)) {
-      if (variable.datatype === "udt" && "udtTemplate" in variable && variable.udtTemplate) {
+      if (
+        variable.datatype === "udt" && "udtTemplate" in variable &&
+        variable.udtTemplate
+      ) {
         udtTypeByBase.set(vid, variable.udtTemplate.name);
       }
     }
@@ -558,7 +636,9 @@ export async function setupNats(
       const existing = deviceGroups.get(eipVar.deviceId);
       const scanRate = eipVar.scanRate ?? 1000;
       // Base tag name is the part before the first dot
-      const baseName = eipVar.tag.includes('.') ? eipVar.tag.substring(0, eipVar.tag.indexOf('.')) : eipVar.tag;
+      const baseName = eipVar.tag.includes(".")
+        ? eipVar.tag.substring(0, eipVar.tag.indexOf("."))
+        : eipVar.tag;
       // Look up UDT template name from the parent variable
       const udtName = udtTypeByBase.get(baseName);
       if (existing) {
@@ -595,8 +675,12 @@ export async function setupNats(
             port: group.port,
             scanRate: group.scanRate,
             tags: group.tags,
-            cipTypes: Object.keys(group.cipTypes).length > 0 ? group.cipTypes : undefined,
-            structTypes: Object.keys(group.structTypes).length > 0 ? group.structTypes : undefined,
+            cipTypes: Object.keys(group.cipTypes).length > 0
+              ? group.cipTypes
+              : undefined,
+            structTypes: Object.keys(group.structTypes).length > 0
+              ? group.structTypes
+              : undefined,
             subscriberId: projectId,
           });
           const response = await nc.request(
@@ -612,7 +696,9 @@ export async function setupNats(
               `Subscribed ${group.tags.length} tag(s) for device ${deviceId} (${group.host}:${group.port})`,
             );
           } else {
-            log.warn(`EtherNet/IP subscribe for ${deviceId} returned success=false`);
+            log.warn(
+              `EtherNet/IP subscribe for ${deviceId} returned success=false`,
+            );
             allSuccess = false;
           }
         }
@@ -646,7 +732,13 @@ export async function setupNats(
   // Collect variables sourced from OPC UA (with connection info)
   const opcuaVariables = new Map<
     string,
-    { variableId: string; nodeId: string; deviceId: string; endpointUrl: string; scanRate?: number }
+    {
+      variableId: string;
+      nodeId: string;
+      deviceId: string;
+      endpointUrl: string;
+      scanRate?: number;
+    }
   >();
   for (const [variableId, variable] of Object.entries(variables)) {
     if (variable.source?.opcua) {
@@ -670,7 +762,9 @@ export async function setupNats(
 
     // Subscribe to data topics immediately
     for (const [variableId, opcuaVar] of opcuaVariables) {
-      const subject = `opcua.data.${opcuaVar.deviceId}.${sanitizeNodeId(opcuaVar.nodeId)}`;
+      const subject = `opcua.data.${opcuaVar.deviceId}.${
+        sanitizeNodeId(opcuaVar.nodeId)
+      }`;
       const abort = new AbortController();
       const sub = nc.subscribe(subject);
 
@@ -1011,8 +1105,12 @@ export async function setupNats(
     };
 
     // Include udtTemplate if this UDT variable has a Sparkplug B template definition
-    if (datatype === "udt" && variable && "udtTemplate" in variable && variable.udtTemplate) {
-      (schemaMessage as Record<string, unknown>).udtTemplate = variable.udtTemplate;
+    if (
+      datatype === "udt" && variable && "udtTemplate" in variable &&
+      variable.udtTemplate
+    ) {
+      (schemaMessage as Record<string, unknown>).udtTemplate =
+        variable.udtTemplate;
     }
 
     if (!isPlcDataMessage(schemaMessage)) {
@@ -1041,7 +1139,10 @@ export async function setupNats(
           deadband: variable?.deadband,
           disableRBE: variable?.disableRBE,
         };
-        await kv.put(variableId, new TextEncoder().encode(JSON.stringify(kvValue)));
+        await kv.put(
+          variableId,
+          new TextEncoder().encode(JSON.stringify(kvValue)),
+        );
       } catch (error) {
         log.warn(`Failed to store in KV: ${variableId}`, error);
       }
@@ -1101,7 +1202,9 @@ export async function setupNats(
               ),
               { timeout: 2000 },
             );
-            log.info(`Unsubscribed ${tags.length} tags from device ${deviceId}`);
+            log.info(
+              `Unsubscribed ${tags.length} tags from device ${deviceId}`,
+            );
           } catch {
             // Best-effort — ethernetip may already be down
           }
@@ -1132,7 +1235,9 @@ export async function setupNats(
               ),
               { timeout: 2000 },
             );
-            log.info(`Unsubscribed ${nodeIds.length} node(s) from OPC UA device ${deviceId}`);
+            log.info(
+              `Unsubscribed ${nodeIds.length} node(s) from OPC UA device ${deviceId}`,
+            );
           } catch {
             // Best-effort — opcua scanner may already be down
           }
@@ -1163,7 +1268,9 @@ export async function setupNats(
               ),
               { timeout: 2000 },
             );
-            log.info(`Unsubscribed ${tagIds.length} tag(s) from Modbus device ${deviceId}`);
+            log.info(
+              `Unsubscribed ${tagIds.length} tag(s) from Modbus device ${deviceId}`,
+            );
           } catch {
             // Best-effort — modbus scanner may already be down
           }
@@ -1210,7 +1317,8 @@ export function parseValue(
       return Number(value);
     case "boolean": {
       const lower = value.toLowerCase().trim();
-      return lower === "true" || lower === "1" || lower === "on" || lower === "yes";
+      return lower === "true" || lower === "1" || lower === "on" ||
+        lower === "yes";
     }
     case "string":
       return value;
