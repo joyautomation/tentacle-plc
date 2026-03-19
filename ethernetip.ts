@@ -64,16 +64,25 @@ type EipVarOptions = {
   disableRBE?: boolean;
 };
 
+/** Extract the UDT type name values from a device's structTags */
+type UdtTypeNames<D extends EipDevice> = D extends { readonly structTags: Readonly<Record<string, infer V>> }
+  ? V & string
+  : string;
+
 /** Filter options for bulk functions */
-type EipBulkOptions = {
+type EipBulkOptions<D extends EipDevice = EipDevice> = {
   /** Only include tags whose name matches this pattern */
   match?: RegExp;
   /** Exclude tags whose name matches this pattern */
   exclude?: RegExp;
   /** Only include struct tags whose UDT type name is in this list (also includes their atomic member tags) */
-  structTypes?: string[];
+  structTypes?: UdtTypeNames<D>[];
   /** When using structTypes, also include all standalone atomic tags (tags not part of any struct) */
   includeAtomicTags?: boolean;
+  /** RBE deadband applied to all numeric variables */
+  deadband?: DeadBandConfig;
+  /** Disable RBE checking on all variables */
+  disableRBE?: boolean;
 };
 
 /** Extract structTags keys if present, else never */
@@ -140,6 +149,7 @@ function makeAtomicVar(
   tagName: string,
   raw: string,
   cipType?: string,
+  bulkOptions?: EipBulkOptions,
 ): PlcVariableNumberConfig | PlcVariableBooleanConfig | PlcVariableStringConfig {
   const dt = inferDatatype(raw);
   const id = tagName.replace(/[^a-zA-Z0-9_]/g, "_");
@@ -147,6 +157,7 @@ function makeAtomicVar(
     id,
     description: "",
     source: makeSource(device, tagName, cipType),
+    ...(bulkOptions?.disableRBE ? { disableRBE: true } : {}),
   };
   switch (dt) {
     case "boolean":
@@ -154,7 +165,7 @@ function makeAtomicVar(
     case "string":
       return { ...base, datatype: "string", default: "" };
     default:
-      return { ...base, datatype: "number", default: 0 };
+      return { ...base, datatype: "number", default: 0, ...(bulkOptions?.deadband ? { deadband: bulkOptions.deadband } : {}) };
   }
 }
 
@@ -232,6 +243,7 @@ function makeUdtVar(
   tagName: string,
   template: UdtTemplateDefinition,
   templates?: UdtTemplateMap,
+  bulkOptions?: EipBulkOptions,
 ): PlcVariableUdtConfig {
   const id = tagName.replace(/[^a-zA-Z0-9_]/g, "_");
   return {
@@ -241,6 +253,8 @@ function makeUdtVar(
     default: buildUdtDefault(template, templates),
     udtTemplate: template,
     memberSources: buildMemberSources(device, tagName, template, templates),
+    ...(bulkOptions?.deadband ? { deadband: bulkOptions.deadband } : {}),
+    ...(bulkOptions?.disableRBE ? { disableRBE: true } : {}),
   };
 }
 
@@ -330,7 +344,7 @@ export function eipVars<D extends EipDevice>(
 ): { [K in keyof D["tags"] & string]: PlcVariableConfig };
 export function eipVars<D extends EipDevice>(
   device: D,
-  options: EipBulkOptions,
+  options: EipBulkOptions<D>,
 ): Record<string, PlcVariableConfig>;
 export function eipVars(
   device: EipDevice,
@@ -339,7 +353,7 @@ export function eipVars(
   const result: Record<string, PlcVariableConfig> = {};
   for (const [tagName, tagInfo] of Object.entries(device.tags)) {
     if (!passesFilter(tagName, options, device.structTags as Record<string, string> | undefined)) continue;
-    result[tagName] = makeAtomicVar(device, tagName, tagInfo.datatype, tagInfo.cipType);
+    result[tagName] = makeAtomicVar(device, tagName, tagInfo.datatype, tagInfo.cipType, options);
   }
   return result;
 }
@@ -355,7 +369,7 @@ export function eipUdtVars<D extends EipDevice>(
 export function eipUdtVars<D extends EipDevice>(
   device: D,
   templates: UdtTemplateMap,
-  options: EipBulkOptions,
+  options: EipBulkOptions<D>,
 ): Record<string, PlcVariableUdtConfig>;
 export function eipUdtVars(
   device: EipDevice,
@@ -368,7 +382,7 @@ export function eipUdtVars(
     if (!passesFilter(tagName, options, device.structTags as Record<string, string>)) continue;
     const template = templates[udtName];
     if (!template) continue;
-    result[tagName] = makeUdtVar(device, tagName, template, templates);
+    result[tagName] = makeUdtVar(device, tagName, template, templates, options);
   }
   return result;
 }
@@ -384,7 +398,7 @@ export function eipAll<D extends EipDevice>(
 export function eipAll<D extends EipDevice>(
   device: D,
   templates: UdtTemplateMap | undefined,
-  options: EipBulkOptions,
+  options: EipBulkOptions<D>,
 ): Record<string, PlcVariableConfig>;
 export function eipAll(
   device: EipDevice,
@@ -402,7 +416,7 @@ export function eipAll(
       const template = templates[udtName];
       if (!template) continue;
       includedStructNames.add(tagName);
-      result[tagName] = makeUdtVar(device, tagName, template, templates);
+      result[tagName] = makeUdtVar(device, tagName, template, templates, options);
     }
   }
   for (const [tagName, tagInfo] of Object.entries(device.tags)) {
@@ -412,7 +426,7 @@ export function eipAll(
       if (dotIdx !== -1 && includedStructNames.has(tagName.substring(0, dotIdx))) continue;
     }
     if (!passesFilter(tagName, options, structTagTypes)) continue;
-    result[tagName] = makeAtomicVar(device, tagName, tagInfo.datatype, tagInfo.cipType);
+    result[tagName] = makeAtomicVar(device, tagName, tagInfo.datatype, tagInfo.cipType, options);
   }
   return result;
 }
