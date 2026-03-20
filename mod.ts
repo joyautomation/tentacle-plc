@@ -95,6 +95,10 @@ export type { OpcUaDevice, OpcUaSource } from "./opcua.ts";
 export { modbusTag } from "./modbus.ts";
 export type { ModbusDevice, ModbusSource } from "./modbus.ts";
 
+// SNMP source helpers
+export { snmpTag, snmpVar, snmpVars, snmpAll } from "./snmp.ts";
+export type { SnmpDevice, SnmpSource } from "./snmp.ts";
+
 // Ladder logic DSL
 export {
   createLadderProgram,

@@ -277,6 +277,7 @@ export async function setupNats(
             const deviceId = variable.source?.ethernetip?.deviceId ??
               variable.source?.opcua?.deviceId ??
               variable.source?.modbus?.deviceId ??
+              variable.source?.snmp?.deviceId ??
               projectId;
             const entry: Record<string, unknown> = {
               moduleId: projectId,
@@ -1063,6 +1064,193 @@ export async function setupNats(
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SNMP source subscriptions
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Collect variables sourced from SNMP
+  const snmpVariables = new Map<
+    string,
+    {
+      variableId: string;
+      oid: string;
+      deviceId: string;
+      host: string;
+      port: number;
+      version: "v1" | "v2c" | "v3";
+      community?: string;
+      v3Auth?: {
+        username: string;
+        authProtocol?: string;
+        authPassword?: string;
+        privProtocol?: string;
+        privPassword?: string;
+        securityLevel: string;
+      };
+      scanRate?: number;
+    }
+  >();
+  for (const [variableId, variable] of Object.entries(variables)) {
+    if (variable.source?.snmp) {
+      snmpVariables.set(variableId, {
+        variableId,
+        ...variable.source.snmp,
+      });
+    }
+  }
+
+  let snmpRetryInterval: ReturnType<typeof setInterval> | null = null;
+
+  if (snmpVariables.size > 0) {
+    log.info(
+      `Setting up SNMP sources for ${snmpVariables.size} variable(s)`,
+    );
+
+    // Sanitize OIDs for NATS subjects (same as snmp scanner)
+    const sanitizeOidForSubject = (oid: string): string =>
+      oid.replace(/^\./, "").replace(/\./g, "_");
+
+    // Subscribe to per-OID data topics
+    for (const [variableId, snmpVar] of snmpVariables) {
+      const subject = `snmp.data.${snmpVar.deviceId}.${
+        sanitizeOidForSubject(snmpVar.oid)
+      }`;
+      if (subscriptions.has(subject)) continue;
+
+      const abort = new AbortController();
+      const sub = nc.subscribe(subject);
+
+      subscriptions.set(subject, async () => {
+        abort.abort();
+        await sub.unsubscribe();
+      });
+
+      const handlerPromise = (async () => {
+        try {
+          for await (const msg of sub) {
+            if (abort.signal.aborted) break;
+            try {
+              const data = JSON.parse(msg.string()) as {
+                value: number | boolean | string | null;
+              };
+              if (data.value !== null && data.value !== undefined) {
+                onVariableUpdate(variableId, data.value);
+              }
+            } catch (error) {
+              log.error(
+                `Error processing SNMP data on ${subject}:`,
+                error,
+              );
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) {
+            log.error(`Error in SNMP subscription for ${subject}:`, error);
+          }
+        }
+      })();
+
+      handlers.set(subject, { abort, promise: handlerPromise });
+      log.debug(`Subscribed to SNMP data: ${subject} → ${variableId}`);
+    }
+
+    // Group SNMP variables by device for per-device subscribe requests
+    const snmpDeviceGroups = new Map<
+      string,
+      {
+        host: string;
+        port: number;
+        version: "v1" | "v2c" | "v3";
+        community?: string;
+        v3Auth?: {
+          username: string;
+          authProtocol?: string;
+          authPassword?: string;
+          privProtocol?: string;
+          privPassword?: string;
+          securityLevel: string;
+        };
+        scanRate: number;
+        oids: string[];
+      }
+    >();
+    for (const snmpVar of snmpVariables.values()) {
+      const existing = snmpDeviceGroups.get(snmpVar.deviceId);
+      const scanRate = snmpVar.scanRate ?? 5000;
+      if (existing) {
+        existing.oids.push(snmpVar.oid);
+        if (scanRate < existing.scanRate) {
+          existing.scanRate = scanRate;
+        }
+      } else {
+        snmpDeviceGroups.set(snmpVar.deviceId, {
+          host: snmpVar.host,
+          port: snmpVar.port,
+          version: snmpVar.version,
+          community: snmpVar.community,
+          v3Auth: snmpVar.v3Auth,
+          scanRate,
+          oids: [snmpVar.oid],
+        });
+      }
+    }
+
+    const attemptSnmpSubscribe = async (): Promise<boolean> => {
+      try {
+        let allSuccess = true;
+        for (const [deviceId, group] of snmpDeviceGroups) {
+          const payload = JSON.stringify({
+            deviceId,
+            host: group.host,
+            port: group.port,
+            version: group.version,
+            ...(group.version === "v3" && group.v3Auth
+              ? { v3Auth: group.v3Auth }
+              : { community: group.community }),
+            scanRate: group.scanRate,
+            oids: group.oids,
+            subscriberId: projectId,
+          });
+          const response = await nc.request(
+            "snmp.subscribe",
+            new TextEncoder().encode(payload),
+            { timeout: 5000 },
+          );
+          const result = JSON.parse(
+            new TextDecoder().decode(response.data),
+          ) as { success: boolean };
+          if (result.success) {
+            log.info(
+              `Subscribed ${group.oids.length} OID(s) for SNMP device ${deviceId} (${group.host}:${group.port})`,
+            );
+          } else {
+            log.warn(`SNMP subscribe for ${deviceId} returned success=false`);
+            allSuccess = false;
+          }
+        }
+        return allSuccess;
+      } catch {
+        log.debug(
+          "SNMP subscribe request failed (scanner may not be running yet)",
+        );
+        return false;
+      }
+    };
+
+    // Try immediately, then retry every 10s if snmp isn't available yet
+    if (!(await attemptSnmpSubscribe())) {
+      log.info(
+        "Will retry SNMP subscribe every 10s until scanner is available",
+      );
+      snmpRetryInterval = setInterval(async () => {
+        if (await attemptSnmpSubscribe()) {
+          clearInterval(snmpRetryInterval!);
+          snmpRetryInterval = null;
+        }
+      }, 10_000);
+    }
+  }
+
   // Helper function to publish all variables
   const publishAllVariables = async (
     publishFn: NatsManager["publish"],
@@ -1273,6 +1461,39 @@ export async function setupNats(
             );
           } catch {
             // Best-effort — modbus scanner may already be down
+          }
+        }
+      }
+
+      // Clean up SNMP retry and unsubscribe
+      if (snmpRetryInterval) {
+        clearInterval(snmpRetryInterval);
+        snmpRetryInterval = null;
+      }
+      if (snmpVariables.size > 0) {
+        const unsubGroups = new Map<string, string[]>();
+        for (const snmpVar of snmpVariables.values()) {
+          const existing = unsubGroups.get(snmpVar.deviceId);
+          if (existing) {
+            existing.push(snmpVar.oid);
+          } else {
+            unsubGroups.set(snmpVar.deviceId, [snmpVar.oid]);
+          }
+        }
+        for (const [deviceId, oids] of unsubGroups) {
+          try {
+            await nc.request(
+              "snmp.unsubscribe",
+              new TextEncoder().encode(
+                JSON.stringify({ deviceId, oids, subscriberId: projectId }),
+              ),
+              { timeout: 2000 },
+            );
+            log.info(
+              `Unsubscribed ${oids.length} OID(s) from SNMP device ${deviceId}`,
+            );
+          } catch {
+            // Best-effort — snmp scanner may already be down
           }
         }
       }

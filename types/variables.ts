@@ -38,6 +38,24 @@ export type VariableSource = {
     byteOrder: string;
     scanRate?: number;
   };
+  /** SNMP OID source — subscribes to SNMP scanner for this OID */
+  snmp?: {
+    deviceId: string;
+    host: string;
+    port: number;
+    version: "v1" | "v2c" | "v3";
+    community?: string;
+    v3Auth?: {
+      username: string;
+      authProtocol?: string;
+      authPassword?: string;
+      privProtocol?: string;
+      privPassword?: string;
+      securityLevel: string;
+    };
+    oid: string;
+    scanRate?: number;
+  };
 };
 
 /** Report By Exception (RBE) deadband configuration */

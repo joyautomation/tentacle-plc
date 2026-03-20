@@ -1,5 +1,5 @@
 /**
- * Codegen — Browse EtherNet/IP and OPC UA devices and generate TypeScript type definitions.
+ * Codegen — Browse EtherNet/IP, OPC UA, and SNMP devices and generate TypeScript type definitions.
  * Also generates Modbus device types from a static register map schema (no live connection needed).
  *
  * Sends browse requests to running scanner instances with connection info,
@@ -7,7 +7,7 @@
  *
  * @example
  * ```typescript
- * import { generateEipTypes, generateOpcuaTypes, generateModbusTypes } from "@tentacle/plc/codegen";
+ * import { generateEipTypes, generateOpcuaTypes, generateModbusTypes, generateSnmpTypes } from "@tentacle/plc/codegen";
  *
  * await generateEipTypes({
  *   nats: { servers: "nats://localhost:4222" },
@@ -34,6 +34,13 @@
  *       { id: "pump_running", address: 0, functionCode: "coil", datatype: "boolean" },
  *     ],
  *   }],
+ *   outputDir: "./generated",
+ * });
+ *
+ * await generateSnmpTypes({
+ *   nats: { servers: "nats://localhost:4222" },
+ *   devices: [{ id: "my-switch", host: "192.168.1.1", community: "public" }],
+ *   mibPaths: ["./mibs/IF-MIB.txt", "./mibs/SNMPv2-MIB.txt"],
  *   outputDir: "./generated",
  * });
  * ```
@@ -887,4 +894,235 @@ export async function generateModbusTypes(
   console.log(
     `Generated ${outputPath} with ${devices.length} device(s) and ${totalTags} tag(s)`,
   );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SNMP Codegen
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** OID info from SNMP browse response (scanner resolves names via MIBs) */
+type SnmpOidInfo = {
+  oid: string;
+  name?: string;
+  key?: string;
+  value: unknown;
+  snmpType: string;
+  datatype: string;
+};
+
+/** SNMP browse result */
+type SnmpBrowseResult = {
+  deviceId: string;
+  rootOid: string;
+  oids: SnmpOidInfo[];
+};
+
+/** SNMPv3 auth config for codegen */
+export type SnmpV3AuthConfig = {
+  username: string;
+  authProtocol?: string;
+  authPassword?: string;
+  privProtocol?: string;
+  privPassword?: string;
+  securityLevel: string;
+};
+
+/** Device definition for SNMP codegen */
+export type SnmpDeviceConfig = {
+  /** Unique device ID */
+  id: string;
+  /** Hostname or IP address */
+  host: string;
+  /** SNMP port (default: 161) */
+  port?: number;
+  /** SNMP version (default: "v2c") */
+  version?: "v1" | "v2c" | "v3";
+  /** Community string for v1/v2c (default: "public") */
+  community?: string;
+  /** SNMPv3 auth params */
+  v3Auth?: SnmpV3AuthConfig;
+  /** Root OID to walk (default: ".1.3.6.1.2.1") */
+  rootOid?: string;
+  /** Scan rate in ms (default: 5000) */
+  scanRate?: number;
+};
+
+export type GenerateSnmpTypesOptions = {
+  nats: NatsConfig;
+  /** SNMP devices to browse */
+  devices: SnmpDeviceConfig[];
+  /** Directory to write generated files to (default: "./generated") */
+  outputDir?: string;
+  /** Timeout in ms per device for the browse to complete (default: 60000) */
+  timeout?: number;
+};
+
+/**
+ * Browse SNMP devices and generate typed device definitions.
+ * MIB resolution is handled by the scanner — configure SNMP_MIB_DIRS on the scanner.
+ */
+export async function generateSnmpTypes(
+  options: GenerateSnmpTypesOptions,
+): Promise<void> {
+  const {
+    nats: natsConfig,
+    devices,
+    outputDir = "./generated",
+    timeout = 60_000,
+  } = options;
+
+  if (devices.length === 0) {
+    console.log("No SNMP devices configured — skipping.");
+    return;
+  }
+
+  const nc = await connect({
+    servers: natsConfig.servers,
+    user: natsConfig.user,
+    pass: natsConfig.pass,
+    token: natsConfig.token,
+  });
+
+  try {
+    console.log(`Browsing ${devices.length} SNMP device(s)...`);
+
+    type DeviceBrowseData = {
+      host: string;
+      port: number;
+      version: "v1" | "v2c" | "v3";
+      community?: string;
+      v3Auth?: SnmpV3AuthConfig;
+      oids: Map<string, { oid: string; datatype: string; snmpType: string; displayName: string }>;
+    };
+    const deviceData = new Map<string, DeviceBrowseData>();
+
+    for (const device of devices) {
+      const port = device.port ?? 161;
+      const version = device.version ?? "v2c";
+      const community = device.community ?? "public";
+      const rootOid = device.rootOid ?? ".1.3.6.1.2.1";
+
+      const browsePayload = JSON.stringify({
+        deviceId: device.id,
+        host: device.host,
+        port,
+        version,
+        ...(version === "v3" && device.v3Auth ? { v3Auth: device.v3Auth } : { community }),
+        rootOid,
+      });
+
+      console.log(`  Browsing ${device.id} (${device.host}:${port}, ${version}, root: ${rootOid})...`);
+
+      let browseResult: SnmpBrowseResult;
+      try {
+        const response = await nc.request(
+          "snmp.browse",
+          new TextEncoder().encode(browsePayload),
+          { timeout },
+        );
+        browseResult = JSON.parse(new TextDecoder().decode(response.data)) as SnmpBrowseResult;
+      } catch (err) {
+        throw new Error(`Browse of ${device.id} failed: ${err}`);
+      }
+
+      console.log(`  Found ${browseResult.oids.length} OIDs`);
+
+      // Use scanner-resolved names (name/key fields from MIB resolution)
+      const oids = new Map<string, { oid: string; datatype: string; snmpType: string; displayName: string }>();
+      const usedKeys = new Set<string>();
+
+      for (const oidInfo of browseResult.oids) {
+        const displayName = oidInfo.name ?? oidInfo.oid;
+        let key = oidInfo.key ?? oidInfo.oid.replace(/^\./, "").replace(/\./g, "_");
+
+        // Handle key collisions
+        if (usedKeys.has(key)) {
+          let suffix = 2;
+          while (usedKeys.has(`${key}_${suffix}`)) suffix++;
+          key = `${key}_${suffix}`;
+        }
+        usedKeys.add(key);
+
+        oids.set(key, {
+          oid: oidInfo.oid,
+          datatype: oidInfo.datatype,
+          snmpType: oidInfo.snmpType,
+          displayName,
+        });
+      }
+
+      deviceData.set(device.id, {
+        host: device.host,
+        port,
+        version,
+        ...(version === "v3" && device.v3Auth ? { v3Auth: device.v3Auth } : { community }),
+        oids,
+      });
+    }
+
+    const totalOids = [...deviceData.values()].reduce(
+      (sum, d) => sum + d.oids.size,
+      0,
+    );
+
+    if (totalOids === 0) {
+      throw new Error(
+        "No OIDs returned after browse. Make sure the SNMP devices are reachable and SNMP is enabled.",
+      );
+    }
+
+    // Generate TypeScript
+    const lines: string[] = [
+      "// Auto-generated by @tentacle/plc codegen (SNMP) — DO NOT EDIT",
+      `// Generated at ${new Date().toISOString()}`,
+      "",
+    ];
+
+    for (const [deviceId, deviceInfo] of deviceData) {
+      const safeId = deviceId.replace(/[^a-zA-Z0-9_]/g, "_");
+      lines.push(`export const ${safeId} = {`);
+      lines.push(`  id: ${JSON.stringify(deviceId)},`);
+      lines.push(`  host: ${JSON.stringify(deviceInfo.host)},`);
+      lines.push(`  port: ${deviceInfo.port},`);
+      lines.push(`  version: ${JSON.stringify(deviceInfo.version)} as const,`);
+      if (deviceInfo.community) {
+        lines.push(`  community: ${JSON.stringify(deviceInfo.community)},`);
+      }
+      if (deviceInfo.v3Auth) {
+        lines.push(`  v3Auth: ${JSON.stringify(deviceInfo.v3Auth)},`);
+      }
+      lines.push(`  oids: {`);
+
+      // Sort OIDs by key for deterministic output
+      const sortedOids = [...deviceInfo.oids.entries()].sort((a, b) =>
+        a[0].localeCompare(b[0]),
+      );
+
+      for (const [key, info] of sortedOids) {
+        lines.push(
+          `    ${JSON.stringify(key)}: { oid: ${JSON.stringify(info.oid)}, datatype: ${JSON.stringify(info.datatype)}, snmpType: ${JSON.stringify(info.snmpType)}, displayName: ${JSON.stringify(info.displayName)} },`,
+        );
+      }
+
+      lines.push(`  },`);
+      lines.push(`} as const;`);
+      lines.push("");
+    }
+
+    // Ensure output directory exists
+    try {
+      await Deno.mkdir(outputDir, { recursive: true });
+    } catch {
+      // Directory may already exist
+    }
+
+    const outputPath = `${outputDir}/snmp.ts`;
+    await Deno.writeTextFile(outputPath, lines.join("\n"));
+
+    console.log(
+      `Generated ${outputPath} with ${deviceData.size} device(s) and ${totalOids} OID(s)`,
+    );
+  } finally {
+    await nc.close();
+  }
 }

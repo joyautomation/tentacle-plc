@@ -4,7 +4,8 @@
   "license": "Apache-2.0",
   "exports": {
     ".": "./mod.ts",
-    "./codegen": "./codegen.ts"
+    "./codegen": "./codegen.ts",
+    "./mib": "./mib.ts"
   },
   "tasks": {
     "dev": "deno run --watch examples/main.ts"
