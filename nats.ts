@@ -319,6 +319,122 @@ export async function setupNats(
 
   log.info(`Listening for variables requests on: ${variablesSubject}`);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Command handler — routes write commands to the appropriate scanner
+  // ═══════════════════════════════════════════════════════════════════════════
+  const commandSubject = `${projectId}.command.>`;
+  const commandSub = nc.subscribe(commandSubject);
+  const commandAbort = new AbortController();
+
+  (async () => {
+    const encoder = new TextEncoder();
+    try {
+      for await (const msg of commandSub) {
+        if (commandAbort.signal.aborted) break;
+        try {
+          // Extract variableId from subject: {projectId}.command.{variableId}
+          const prefix = `${projectId}.command.`;
+          const variableId = msg.subject.slice(prefix.length);
+          if (!variableId) continue;
+
+          const variable = variables[variableId];
+          if (!variable) {
+            log.warn(`Command for unknown variable: ${variableId}`);
+            continue;
+          }
+
+          // Parse the incoming value
+          let newValue: number | boolean | string;
+          const rawValue = new TextDecoder().decode(msg.data);
+          if (variable.datatype === "number") {
+            newValue = parseFloat(rawValue);
+            if (isNaN(newValue)) {
+              log.warn(`Invalid number value for ${variableId}: ${rawValue}`);
+              continue;
+            }
+          } else if (variable.datatype === "boolean") {
+            const lower = rawValue.toLowerCase();
+            newValue = lower === "true" || lower === "1" || lower === "on" || lower === "yes";
+          } else {
+            newValue = rawValue;
+          }
+
+          // Update local variable value
+          onVariableUpdate(variableId, newValue);
+          log.info(`Command received: ${variableId} = ${newValue}`);
+
+          // Route to the appropriate scanner
+          const source = variable.source;
+          if (source?.snmp) {
+            const snmp = source.snmp;
+            const setPayload = {
+              deviceId: snmp.deviceId,
+              host: snmp.host,
+              port: snmp.port,
+              version: snmp.version,
+              community: snmp.community,
+              v3Auth: snmp.v3Auth,
+              variables: [{
+                oid: snmp.oid,
+                type: variable.datatype === "number" ? "integer" : "string",
+                value: newValue,
+              }],
+            };
+            try {
+              const resp = await nc.request(
+                "snmp.set",
+                encoder.encode(JSON.stringify(setPayload)),
+                { timeout: 5000 },
+              );
+              const result = JSON.parse(new TextDecoder().decode(resp.data));
+              if (result.success) {
+                log.info(`SNMP SET success: ${variableId} (${snmp.oid}) = ${newValue}`);
+              } else {
+                log.warn(`SNMP SET failed: ${variableId}: ${result.error ?? "unknown error"}`);
+              }
+            } catch (err) {
+              log.error(`SNMP SET request failed for ${variableId}: ${err}`);
+            }
+          } else if (source?.ethernetip) {
+            const eip = source.ethernetip;
+            const commandTopic = substituteTopic(NATS_TOPICS.module.command, {
+              moduleId: "ethernetip",
+              variableId: eip.tag,
+            });
+            nc.publish(commandTopic, encoder.encode(String(newValue)));
+            log.info(`EtherNet/IP write: ${eip.tag} = ${newValue}`);
+          } else if (source?.opcua) {
+            const opcua = source.opcua;
+            const commandTopic = substituteTopic(NATS_TOPICS.module.command, {
+              moduleId: "opcua",
+              variableId: opcua.nodeId,
+            });
+            nc.publish(commandTopic, encoder.encode(String(newValue)));
+            log.info(`OPC UA write: ${opcua.nodeId} = ${newValue}`);
+          } else if (source?.modbus) {
+            const mb = source.modbus;
+            const commandTopic = substituteTopic(NATS_TOPICS.module.command, {
+              moduleId: "modbus",
+              variableId: mb.tag,
+            });
+            nc.publish(commandTopic, encoder.encode(String(newValue)));
+            log.info(`Modbus write: ${mb.tag} = ${newValue}`);
+          } else {
+            log.debug(`No scanner source for ${variableId}, value updated locally only`);
+          }
+        } catch (error) {
+          log.error("Error handling command:", error);
+        }
+      }
+    } catch (error) {
+      if (!commandAbort.signal.aborted) {
+        log.error("Error in command listener:", error);
+      }
+    }
+  })();
+
+  log.info(`Listening for commands on: ${commandSubject}`);
+
   const subscriptions = new Map<string, () => Promise<void>>();
   const handlers = new Map<string, SubscriptionHandler>();
 
@@ -1520,6 +1636,10 @@ export async function setupNats(
           }
         }
       }
+
+      // Stop command listener
+      commandAbort.abort();
+      await commandSub.unsubscribe();
 
       // Stop shutdown listener
       shutdownAbort.abort();
