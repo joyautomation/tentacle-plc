@@ -106,8 +106,8 @@ async function createKVStore(
       name: streamName,
       subjects: [`${subjectPrefix}.>`],
       storage: StorageType.File,
-      discard: DiscardPolicy.New,
-      max_age: 0, // No TTL for KV
+      discard: DiscardPolicy.Old,
+      max_msgs_per_subject: 1, // KV semantics: keep only latest value per key
     });
     log.info(`KV bucket created: ${bucketName}`);
   }
