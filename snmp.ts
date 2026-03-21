@@ -23,12 +23,18 @@
  * ```
  */
 
-import type {
-  DeadBandConfig,
-  PlcVariableBooleanConfig,
-  PlcVariableConfig,
-  PlcVariableNumberConfig,
-  PlcVariableStringConfig,
+import {
+  resolveRbe,
+  type DeadBandConfig,
+  type PlcVariableBooleanConfig,
+  type PlcVariableConfig,
+  type PlcVariableNumberConfig,
+  type PlcVariableStringConfig,
+  type PlcVariableUdtConfig,
+  type RbeOverride,
+  type RbeRule,
+  type UdtTemplateDefinition,
+  type VariableSource,
 } from "./types/variables.ts";
 
 /** Shape of a generated SNMP device constant (from codegen) */
@@ -57,7 +63,17 @@ export type SnmpDevice = {
       }
     >
   >;
+  readonly structTags?: Readonly<Record<string, string>>;
 };
+
+/** Map of SNMP table type names to their template definitions */
+export type SnmpTableTemplateMap = Readonly<Record<string, UdtTemplateDefinition & {
+  readonly members: ReadonlyArray<{
+    readonly name: string;
+    readonly datatype: "number" | "boolean" | "string";
+    readonly subId: number;
+  }>;
+}>>;
 
 /** Source descriptor for an SNMP OID */
 export type SnmpSource = {
@@ -86,12 +102,16 @@ type SnmpBulkOptions = {
   match?: RegExp;
   /** Exclude OIDs whose key matches this pattern */
   exclude?: RegExp;
-  /** RBE deadband applied to all numeric variables */
+  /** Default RBE deadband applied to all numeric variables (lowest priority) */
   deadband?: DeadBandConfig;
-  /** Disable RBE checking on all variables */
+  /** Disable RBE checking on all variables (lowest priority) */
   disableRBE?: boolean;
   /** Override scan rate for all variables */
   scanRate?: number;
+  /** Pattern-based RBE rules — first matching rule wins (overrides default deadband/disableRBE) */
+  rbeRules?: RbeRule[];
+  /** Per-tag RBE overrides — highest priority */
+  rbeOverrides?: Record<string, RbeOverride>;
 };
 
 /**
@@ -157,11 +177,12 @@ function makeAtomicVar(
 ): PlcVariableNumberConfig | PlcVariableBooleanConfig | PlcVariableStringConfig {
   const dt = inferDatatype(datatype);
   const id = key.replace(/[^a-zA-Z0-9_]/g, "_");
+  const rbe = resolveRbe(key, bulkOptions);
   const base = {
     id,
     description: "",
     source: makeSource(device, oid, bulkOptions?.scanRate),
-    ...(bulkOptions?.disableRBE ? { disableRBE: true } : {}),
+    ...(rbe.disableRBE ? { disableRBE: true } : {}),
   };
   switch (dt) {
     case "boolean":
@@ -173,7 +194,7 @@ function makeAtomicVar(
         ...base,
         datatype: "number",
         default: 0,
-        ...(bulkOptions?.deadband ? { deadband: bulkOptions.deadband } : {}),
+        ...(rbe.deadband ? { deadband: rbe.deadband } : {}),
       };
   }
 }
@@ -248,21 +269,140 @@ export function snmpVars(
   return result;
 }
 
+/** Build a default value object from a table template */
+function buildTableDefault(
+  template: UdtTemplateDefinition,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const member of template.members) {
+    switch (member.datatype) {
+      case "boolean":
+        result[member.name] = false;
+        break;
+      case "number":
+        result[member.name] = 0;
+        break;
+      default:
+        result[member.name] = "";
+        break;
+    }
+  }
+  return result;
+}
+
+/** Build per-member SNMP sources for a table instance.
+ *  Each column gets its own SNMP OID subscription. */
+function buildTableMemberSources(
+  device: SnmpDevice,
+  instanceKey: string,
+  template: UdtTemplateDefinition & { members: ReadonlyArray<{ name: string; subId?: number }> },
+  bulkOptions?: SnmpBulkOptions,
+): Record<string, VariableSource> {
+  const sources: Record<string, VariableSource> = {};
+  for (const member of template.members) {
+    // Look up the per-instance column OID from the device's oids map
+    // Codegen places these as "instanceKey_columnName" keys
+    const memberOidKey = `${instanceKey}_${member.name}`;
+    // Also try the direct resolved name pattern: "columnName.instanceSuffix"
+    const info = (device.oids as Record<string, { oid: string }>)[memberOidKey];
+    if (!info) continue;
+
+    sources[member.name] = makeSource(device, info.oid, bulkOptions?.scanRate);
+  }
+  return sources;
+}
+
+/** Create a UDT variable for an SNMP table instance */
+function makeSnmpUdtVar(
+  device: SnmpDevice,
+  instanceKey: string,
+  template: UdtTemplateDefinition & { members: ReadonlyArray<{ name: string; subId?: number }> },
+  bulkOptions?: SnmpBulkOptions,
+): PlcVariableUdtConfig {
+  const id = instanceKey.replace(/[^a-zA-Z0-9_]/g, "_");
+  const rbe = resolveRbe(instanceKey, bulkOptions);
+  return {
+    id,
+    description: `${template.name} instance`,
+    datatype: "udt",
+    default: buildTableDefault(template),
+    udtTemplate: template,
+    memberSources: buildTableMemberSources(device, instanceKey, template, bulkOptions),
+    ...(rbe.deadband ? { deadband: rbe.deadband } : {}),
+    ...(rbe.disableRBE ? { disableRBE: true } : {}),
+  };
+}
+
 /**
- * Bulk-create PlcVariableConfigs for ALL OIDs on a device.
- * Alias for snmpVars — SNMP has no struct/UDT distinction.
- * Provided for API consistency with eipAll.
+ * Bulk-create PlcVariableConfigs for ALL OIDs on a device (atomic + table structs).
+ * When templates are provided, table instances become UDT variables with memberSources.
+ * Without templates, all OIDs are treated as atomic variables.
  */
 export function snmpAll<D extends SnmpDevice>(
   device: D,
+  templates?: SnmpTableTemplateMap,
 ): { [K in keyof D["oids"] & string]: PlcVariableConfig };
+export function snmpAll<D extends SnmpDevice>(
+  device: D,
+  templates: SnmpTableTemplateMap | undefined,
+  options: SnmpBulkOptions,
+): Record<string, PlcVariableConfig>;
+// Legacy overload: no templates, just options
 export function snmpAll<D extends SnmpDevice>(
   device: D,
   options: SnmpBulkOptions,
 ): Record<string, PlcVariableConfig>;
 export function snmpAll(
   device: SnmpDevice,
-  options?: SnmpBulkOptions,
+  templatesOrOptions?: SnmpTableTemplateMap | SnmpBulkOptions,
+  maybeOptions?: SnmpBulkOptions,
 ): Record<string, PlcVariableConfig> {
-  return snmpVars(device, options as SnmpBulkOptions);
+  // Disambiguate overloads: if second arg has match/exclude/deadband, it's options
+  let templates: SnmpTableTemplateMap | undefined;
+  let options: SnmpBulkOptions | undefined;
+
+  if (templatesOrOptions && ("match" in templatesOrOptions || "exclude" in templatesOrOptions || "deadband" in templatesOrOptions || "disableRBE" in templatesOrOptions || "scanRate" in templatesOrOptions || "rbeRules" in templatesOrOptions)) {
+    options = templatesOrOptions as SnmpBulkOptions;
+  } else {
+    templates = templatesOrOptions as SnmpTableTemplateMap | undefined;
+    options = maybeOptions;
+  }
+
+  const result: Record<string, PlcVariableConfig> = {};
+  const structTags = device.structTags as Record<string, string> | undefined;
+
+  // Build UDT variables first from structTags
+  const includedStructNames = new Set<string>();
+  if (templates && structTags) {
+    for (const [instanceKey, typeName] of Object.entries(structTags)) {
+      if (!passesFilter(instanceKey, options)) continue;
+      const template = templates[typeName];
+      if (!template) continue;
+      includedStructNames.add(instanceKey);
+      result[instanceKey] = makeSnmpUdtVar(device, instanceKey, template, options);
+    }
+  }
+
+  // Add remaining atomic OIDs (skip those that belong to included table instances)
+  for (const [key, info] of Object.entries(device.oids)) {
+    // Skip OIDs that are columns of included table instances
+    if (includedStructNames.size > 0) {
+      const underscoreIdx = key.indexOf("_");
+      if (underscoreIdx !== -1) {
+        // Check if any structTag key is a prefix of this OID key
+        let isColumn = false;
+        for (const structKey of includedStructNames) {
+          if (key.startsWith(structKey + "_")) {
+            isColumn = true;
+            break;
+          }
+        }
+        if (isColumn) continue;
+      }
+    }
+    if (!passesFilter(key, options)) continue;
+    result[key] = makeAtomicVar(device, key, info.oid, info.datatype, options);
+  }
+
+  return result;
 }

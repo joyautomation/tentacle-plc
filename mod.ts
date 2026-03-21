@@ -60,6 +60,8 @@ export type {
   PlcVariablesRuntime,
   VariableSource,
   DeadBandConfig,
+  RbeRule,
+  RbeOverride,
   UdtTemplateDefinition,
   NatsConfig,
 } from "./types/variables.ts";
@@ -81,6 +83,7 @@ export {
   isVariableString,
   isVariableUdt,
   isVariableType,
+  resolveRbe,
 } from "./types/variables.ts";
 
 // EtherNet/IP source helpers
@@ -88,7 +91,7 @@ export { eipTag, eipVar, eipUdtVar, eipVars, eipUdtVars, eipAll } from "./ethern
 export type { EipDevice, EthernetIPSource, UdtTemplateMap } from "./ethernetip.ts";
 
 // OPC UA source helpers
-export { opcuaTag } from "./opcua.ts";
+export { opcuaTag, opcuaVar, opcuaVars, opcuaAll } from "./opcua.ts";
 export type { OpcUaDevice, OpcUaSource } from "./opcua.ts";
 
 // Modbus source helpers
@@ -97,7 +100,7 @@ export type { ModbusDevice, ModbusSource } from "./modbus.ts";
 
 // SNMP source helpers
 export { snmpTag, snmpVar, snmpVars, snmpAll } from "./snmp.ts";
-export type { SnmpDevice, SnmpSource } from "./snmp.ts";
+export type { SnmpDevice, SnmpSource, SnmpTableTemplateMap } from "./snmp.ts";
 
 // Ladder logic DSL
 export {

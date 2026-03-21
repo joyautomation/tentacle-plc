@@ -21,18 +21,34 @@
  *   description: "Pit temperature",
  *   deadband: { value: 0.1 },
  * });
+ *
+ * // Filter-based RBE with individual overrides:
+ * const variables = { ...eipAll(rtu45, udtTemplates, {
+ *   deadband: { value: 1.0 },                    // default for all numerics
+ *   rbeRules: [
+ *     { match: /PIT_\d+\.VALUE/, deadband: { value: 0.1, maxTime: 30000 } },
+ *     { match: /TIT_\d+\.VALUE/, deadband: { value: 0.5, maxTime: 60000 } },
+ *     { match: /STATUS/,         disableRBE: true },
+ *   ],
+ *   rbeOverrides: {
+ *     "RTU45_RECLM_PIT_001.VALUE": { deadband: { value: 0.01 } },
+ *   },
+ * }) };
  * ```
  */
 
-import type {
-  DeadBandConfig,
-  PlcVariableBooleanConfig,
-  PlcVariableConfig,
-  PlcVariableNumberConfig,
-  PlcVariableStringConfig,
-  PlcVariableUdtConfig,
-  UdtTemplateDefinition,
-  VariableSource,
+import {
+  resolveRbe,
+  type DeadBandConfig,
+  type PlcVariableBooleanConfig,
+  type PlcVariableConfig,
+  type PlcVariableNumberConfig,
+  type PlcVariableStringConfig,
+  type PlcVariableUdtConfig,
+  type RbeOverride,
+  type RbeRule,
+  type UdtTemplateDefinition,
+  type VariableSource,
 } from "./types/variables.ts";
 
 /** Shape of a generated EIP device constant (from codegen) */
@@ -79,10 +95,14 @@ type EipBulkOptions<D extends EipDevice = EipDevice> = {
   structTypes?: UdtTypeNames<D>[];
   /** When using structTypes, also include all standalone atomic tags (tags not part of any struct) */
   includeAtomicTags?: boolean;
-  /** RBE deadband applied to all numeric variables */
+  /** Default RBE deadband applied to all numeric variables (lowest priority) */
   deadband?: DeadBandConfig;
-  /** Disable RBE checking on all variables */
+  /** Disable RBE checking on all variables (lowest priority) */
   disableRBE?: boolean;
+  /** Pattern-based RBE rules — first matching rule wins (overrides default deadband/disableRBE) */
+  rbeRules?: RbeRule[];
+  /** Per-tag RBE overrides — highest priority */
+  rbeOverrides?: Record<string, RbeOverride>;
 };
 
 /** Extract structTags keys if present, else never */
@@ -153,11 +173,12 @@ function makeAtomicVar(
 ): PlcVariableNumberConfig | PlcVariableBooleanConfig | PlcVariableStringConfig {
   const dt = inferDatatype(raw);
   const id = tagName.replace(/[^a-zA-Z0-9_]/g, "_");
+  const rbe = resolveRbe(tagName, bulkOptions);
   const base = {
     id,
     description: "",
     source: makeSource(device, tagName, cipType),
-    ...(bulkOptions?.disableRBE ? { disableRBE: true } : {}),
+    ...(rbe.disableRBE ? { disableRBE: true } : {}),
   };
   switch (dt) {
     case "boolean":
@@ -165,7 +186,7 @@ function makeAtomicVar(
     case "string":
       return { ...base, datatype: "string", default: "" };
     default:
-      return { ...base, datatype: "number", default: 0, ...(bulkOptions?.deadband ? { deadband: bulkOptions.deadband } : {}) };
+      return { ...base, datatype: "number", default: 0, ...(rbe.deadband ? { deadband: rbe.deadband } : {}) };
   }
 }
 
@@ -246,6 +267,7 @@ function makeUdtVar(
   bulkOptions?: EipBulkOptions,
 ): PlcVariableUdtConfig {
   const id = tagName.replace(/[^a-zA-Z0-9_]/g, "_");
+  const rbe = resolveRbe(tagName, bulkOptions);
   return {
     id,
     description: `${template.name} instance`,
@@ -253,8 +275,8 @@ function makeUdtVar(
     default: buildUdtDefault(template, templates),
     udtTemplate: template,
     memberSources: buildMemberSources(device, tagName, template, templates),
-    ...(bulkOptions?.deadband ? { deadband: bulkOptions.deadband } : {}),
-    ...(bulkOptions?.disableRBE ? { disableRBE: true } : {}),
+    ...(rbe.deadband ? { deadband: rbe.deadband } : {}),
+    ...(rbe.disableRBE ? { disableRBE: true } : {}),
   };
 }
 

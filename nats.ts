@@ -8,6 +8,7 @@ import { connect, type NatsConnection } from "@nats-io/transport-deno";
 import { DiscardPolicy, jetstream, StorageType } from "@nats-io/jetstream";
 import { type KV, Kvm } from "@nats-io/kv";
 import type {
+  DeadBandConfig,
   NatsConfig,
   PlcVariable,
   VariableSource,
@@ -411,6 +412,8 @@ export async function setupNats(
       port: number;
       cipType?: string;
       scanRate?: number;
+      deadband?: DeadBandConfig;
+      disableRBE?: boolean;
     }
   >();
   // Map from EIP tag → { udtVarId, memberPath } for routing data into UDT values
@@ -424,6 +427,8 @@ export async function setupNats(
       eipVariables.set(variableId, {
         variableId,
         ...variable.source.ethernetip,
+        deadband: variable.deadband,
+        disableRBE: variable.disableRBE,
       });
     }
     // Extract member sources from UDT variables
@@ -453,6 +458,8 @@ export async function setupNats(
           eipVariables.set(memberKey, {
             variableId: memberKey,
             ...memberSource.ethernetip,
+            deadband: variable.deadband,
+            disableRBE: variable.disableRBE,
           });
           eipTagToUdtMember.set(memberSource.ethernetip.tag, {
             udtVarId: variableId,
@@ -620,6 +627,8 @@ export async function setupNats(
         tags: string[];
         cipTypes: Record<string, string>;
         structTypes: Record<string, string>;
+        deadbands: Record<string, DeadBandConfig>;
+        disableRBE: Record<string, boolean>;
       }
     >();
     // Build a lookup of base variable name → UDT template name
@@ -646,6 +655,8 @@ export async function setupNats(
         existing.tags.push(eipVar.tag);
         if (eipVar.cipType) existing.cipTypes[eipVar.tag] = eipVar.cipType;
         if (udtName) existing.structTypes[baseName] = udtName;
+        if (eipVar.deadband) existing.deadbands[eipVar.tag] = eipVar.deadband;
+        if (eipVar.disableRBE) existing.disableRBE[eipVar.tag] = true;
         // Use fastest scan rate
         if (scanRate < existing.scanRate) {
           existing.scanRate = scanRate;
@@ -653,8 +664,12 @@ export async function setupNats(
       } else {
         const cipTypes: Record<string, string> = {};
         const structTypes: Record<string, string> = {};
+        const deadbands: Record<string, DeadBandConfig> = {};
+        const disableRBE: Record<string, boolean> = {};
         if (eipVar.cipType) cipTypes[eipVar.tag] = eipVar.cipType;
         if (udtName) structTypes[baseName] = udtName;
+        if (eipVar.deadband) deadbands[eipVar.tag] = eipVar.deadband;
+        if (eipVar.disableRBE) disableRBE[eipVar.tag] = true;
         deviceGroups.set(eipVar.deviceId, {
           host: eipVar.host,
           port: eipVar.port,
@@ -662,6 +677,8 @@ export async function setupNats(
           tags: [eipVar.tag],
           cipTypes,
           structTypes,
+          deadbands,
+          disableRBE,
         });
       }
     }
@@ -681,6 +698,12 @@ export async function setupNats(
               : undefined,
             structTypes: Object.keys(group.structTypes).length > 0
               ? group.structTypes
+              : undefined,
+            deadbands: Object.keys(group.deadbands).length > 0
+              ? group.deadbands
+              : undefined,
+            disableRBE: Object.keys(group.disableRBE).length > 0
+              ? group.disableRBE
               : undefined,
             subscriberId: projectId,
           });

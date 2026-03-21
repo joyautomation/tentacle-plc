@@ -62,9 +62,57 @@ export type VariableSource = {
 export type DeadBandConfig = {
   /** Threshold value: only publish if change exceeds this amount (for numeric types) */
   value: number;
+  /** Minimum time (ms) between publishes. Suppresses rapid changes. */
+  minTime?: number;
   /** Maximum time (ms) between publishes regardless of change. Forces publish if exceeded. */
   maxTime?: number;
 };
+
+/** Pattern-based RBE rule for bulk variable configuration */
+export type RbeRule = {
+  /** Tags matching this pattern get the specified RBE config */
+  match: RegExp;
+  /** Deadband configuration for matching tags */
+  deadband?: DeadBandConfig;
+  /** Disable RBE checking for matching tags */
+  disableRBE?: boolean;
+};
+
+/** Per-tag RBE override (highest priority) */
+export type RbeOverride = {
+  deadband?: DeadBandConfig;
+  disableRBE?: boolean;
+};
+
+/**
+ * Resolve RBE configuration for a tag using priority: override > rule > default.
+ * Returns { deadband, disableRBE } with undefined for unset fields.
+ */
+export function resolveRbe(
+  tagName: string,
+  options?: {
+    deadband?: DeadBandConfig;
+    disableRBE?: boolean;
+    rbeRules?: RbeRule[];
+    rbeOverrides?: Record<string, RbeOverride>;
+  },
+): { deadband?: DeadBandConfig; disableRBE?: boolean } {
+  if (!options) return {};
+  // Per-tag override (highest priority)
+  if (options.rbeOverrides?.[tagName]) {
+    return options.rbeOverrides[tagName];
+  }
+  // First matching rule wins
+  if (options.rbeRules) {
+    for (const rule of options.rbeRules) {
+      if (rule.match.test(tagName)) {
+        return { deadband: rule.deadband, disableRBE: rule.disableRBE };
+      }
+    }
+  }
+  // Default
+  return { deadband: options.deadband, disableRBE: options.disableRBE };
+}
 
 // =============================================================================
 // Configuration Types (what user defines - no runtime value)
