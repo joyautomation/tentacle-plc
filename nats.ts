@@ -1288,6 +1288,40 @@ export async function setupNats(
   // Note: variable report requests are handled by variablesSub (set up earlier)
   // No separate subscription needed here — variablesSub responds via msg.respond()
 
+  // RBE state tracking for minTime/maxTime/deadband gating
+  const rbeState = new Map<string, { lastValue: unknown; lastTime: number }>();
+
+  function shouldPublish(
+    variableId: string,
+    value: unknown,
+    variable?: PlcVariable,
+  ): boolean {
+    if (variable?.disableRBE) return true;
+    const deadband = variable?.deadband;
+    const state = rbeState.get(variableId);
+    if (!state) return true; // first publish always goes through
+
+    const now = Date.now();
+    const elapsed = now - state.lastTime;
+
+    if (deadband) {
+      // maxTime exceeded — force publish
+      if (deadband.maxTime && elapsed >= deadband.maxTime) return true;
+      // minTime not elapsed — suppress
+      if (deadband.minTime && elapsed < deadband.minTime) return false;
+      // numeric deadband threshold
+      if (typeof value === "number" && typeof state.lastValue === "number") {
+        return Math.abs(value - state.lastValue) > deadband.value;
+      }
+    }
+
+    // Default: publish on any change
+    if (typeof value === "object" && value !== null) {
+      return JSON.stringify(value) !== JSON.stringify(state.lastValue);
+    }
+    return value !== state.lastValue;
+  }
+
   // Create the publish function first so it can be used by publishAll
   const publish = async (
     variableId: string,
@@ -1296,6 +1330,11 @@ export async function setupNats(
   ): Promise<void> => {
     // Get variable config for transforms
     const variable = variables[variableId];
+
+    // RBE gating — skip publish if deadband/minTime says no
+    if (!shouldPublish(variableId, value, variable as PlcVariable | undefined)) {
+      return;
+    }
     let finalValue = value;
 
     // Apply onSend transform if configured
@@ -1335,6 +1374,9 @@ export async function setupNats(
     });
 
     nc.publish(schemaSubject, JSON.stringify(schemaMessage));
+
+    // Record RBE state after successful publish
+    rbeState.set(variableId, { lastValue: finalValue, lastTime: Date.now() });
 
     // Store in KV with full schema
     if (kv) {
