@@ -386,11 +386,16 @@ export async function setupNats(
                 encoder.encode(JSON.stringify(setPayload)),
                 { timeout: 5000 },
               );
-              const result = JSON.parse(new TextDecoder().decode(resp.data));
+              const result = JSON.parse(new TextDecoder().decode(resp.data)) as {
+                success: boolean;
+                error?: string;
+                errorStatus?: number;
+              };
               if (result.success) {
                 log.info(`SNMP SET success: ${variableId} (${snmp.oid}) = ${newValue}`);
               } else {
-                log.warn(`SNMP SET failed: ${variableId}: ${result.error ?? "unknown error"}`);
+                const reason = result.error ?? (result.errorStatus != null ? `SNMP error status ${result.errorStatus}` : "unknown error");
+                log.warn(`SNMP SET failed: ${variableId}: ${reason}`);
               }
             } catch (err) {
               log.error(`SNMP SET request failed for ${variableId}: ${err}`);
