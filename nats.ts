@@ -62,6 +62,10 @@ type SubscriptionHandler = {
   promise: Promise<void>;
 };
 
+/** Sanitize a device ID for use in NATS subjects (spaces and special chars are invalid). */
+const sanitizeDeviceId = (id: string): string =>
+  id.replace(/[ .*>]/g, "_");
+
 /**
  * Type guard to check if a value has a NATS source configuration
  */
@@ -166,6 +170,7 @@ export async function setupNats(
     value: number | boolean | string,
   ) => void,
   onShutdown?: () => Promise<void>,
+  skipHeartbeat?: boolean,
 ): Promise<NatsManager> {
   const nc = await connect({
     servers: config.servers,
@@ -185,38 +190,42 @@ export async function setupNats(
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   const startedAt = Date.now();
 
-  try {
-    heartbeatsKv = await kvm.create("service_heartbeats", {
-      history: 1,
-      ttl: 60 * 1000, // 1 minute TTL
-    });
+  if (!skipHeartbeat) {
+    try {
+      heartbeatsKv = await kvm.create("service_heartbeats", {
+        history: 1,
+        ttl: 60 * 1000, // 1 minute TTL
+      });
 
-    const publishHeartbeat = async () => {
-      const heartbeat: ServiceHeartbeat = {
-        serviceType: "plc",
-        moduleId: projectId,
-        lastSeen: Date.now(),
-        startedAt,
-        metadata: {
-          cwd: Deno.cwd(),
-        },
+      const publishHeartbeat = async () => {
+        const heartbeat: ServiceHeartbeat = {
+          serviceType: "plc",
+          moduleId: projectId,
+          lastSeen: Date.now(),
+          startedAt,
+          metadata: {
+            cwd: Deno.cwd(),
+          },
+        };
+        try {
+          const encoder = new TextEncoder();
+          await heartbeatsKv!.put(
+            projectId,
+            encoder.encode(JSON.stringify(heartbeat)),
+          );
+        } catch (err) {
+          log.warn(`Failed to publish heartbeat: ${err}`);
+        }
       };
-      try {
-        const encoder = new TextEncoder();
-        await heartbeatsKv!.put(
-          projectId,
-          encoder.encode(JSON.stringify(heartbeat)),
-        );
-      } catch (err) {
-        log.warn(`Failed to publish heartbeat: ${err}`);
-      }
-    };
 
-    await publishHeartbeat();
-    log.info(`Service heartbeat started (moduleId: ${projectId})`);
-    heartbeatInterval = setInterval(publishHeartbeat, 10000);
-  } catch (err) {
-    log.warn(`Failed to initialize heartbeat publishing: ${err}`);
+      await publishHeartbeat();
+      log.info(`Service heartbeat started (moduleId: ${projectId})`);
+      heartbeatInterval = setInterval(publishHeartbeat, 10000);
+    } catch (err) {
+      log.warn(`Failed to initialize heartbeat publishing: ${err}`);
+    }
+  } else {
+    log.info(`Heartbeat publishing skipped (managed by parent service)`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -604,7 +613,7 @@ export async function setupNats(
     // Subscribe to data topics immediately — NATS subscriptions work before
     // ethernetip publishes, so no messages are missed.
     for (const [, eipVar] of eipVariables) {
-      const subject = `ethernetip.data.${eipVar.deviceId}.${
+      const subject = `ethernetip.data.${sanitizeDeviceId(eipVar.deviceId)}.${
         sanitizeForSubject(eipVar.tag)
       }`;
       // Skip if already subscribed (multiple UDT members can share a device subject prefix)
@@ -668,7 +677,7 @@ export async function setupNats(
       [...eipVariables.values()].map((v) => v.deviceId),
     );
     for (const deviceId of deviceIds) {
-      const batchSubject = `ethernetip.data.${deviceId}`;
+      const batchSubject = `ethernetip.data.${sanitizeDeviceId(deviceId)}`;
       const abort = new AbortController();
       const sub = nc.subscribe(batchSubject);
 
@@ -907,7 +916,7 @@ export async function setupNats(
 
     // Subscribe to data topics immediately
     for (const [variableId, opcuaVar] of opcuaVariables) {
-      const subject = `opcua.data.${opcuaVar.deviceId}.${
+      const subject = `opcua.data.${sanitizeDeviceId(opcuaVar.deviceId)}.${
         sanitizeNodeId(opcuaVar.nodeId)
       }`;
       const abort = new AbortController();
@@ -1063,7 +1072,7 @@ export async function setupNats(
       [...modbusVariables.values()].map((v) => v.deviceId),
     );
     for (const deviceId of modbusDeviceIds) {
-      const subject = `modbus.data.${deviceId}`;
+      const subject = `modbus.data.${sanitizeDeviceId(deviceId)}`;
       const abort = new AbortController();
       const sub = nc.subscribe(subject);
 
@@ -1256,7 +1265,7 @@ export async function setupNats(
 
     // Subscribe to per-OID data topics
     for (const [variableId, snmpVar] of snmpVariables) {
-      const subject = `snmp.data.${snmpVar.deviceId}.${
+      const subject = `snmp.data.${sanitizeDeviceId(snmpVar.deviceId)}.${
         sanitizeOidForSubject(snmpVar.oid)
       }`;
       if (subscriptions.has(subject)) continue;

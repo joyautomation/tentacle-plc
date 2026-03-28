@@ -164,6 +164,7 @@ export async function createPlc<V extends PlcVariablesConfig>(
       }
       Deno.exit(0);
     },
+    config.skipHeartbeat,
   );
 
   // Wire up deferred publish now that natsManager exists

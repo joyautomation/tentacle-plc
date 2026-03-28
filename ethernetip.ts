@@ -56,6 +56,7 @@ export type EipDevice = {
   readonly id: string;
   readonly host: string;
   readonly port: number;
+  readonly scanRate?: number;
   readonly tags: Readonly<Record<string, { readonly datatype: string; readonly cipType?: string }>>;
   readonly structTags?: Readonly<Record<string, string>>;
 };
@@ -95,6 +96,8 @@ type EipBulkOptions<D extends EipDevice = EipDevice> = {
   structTypes?: UdtTypeNames<D>[];
   /** When using structTypes, also include all standalone atomic tags (tags not part of any struct) */
   includeAtomicTags?: boolean;
+  /** Scan rate in ms for EtherNet/IP polling (default: 1000) */
+  scanRate?: number;
   /** Default RBE deadband applied to all numeric variables (lowest priority) */
   deadband?: DeadBandConfig;
   /** Disable RBE checking on all variables (lowest priority) */
@@ -151,7 +154,8 @@ function inferDatatype(
 }
 
 /** Build an EthernetIPSource object */
-function makeSource(device: EipDevice, tag: string, cipType?: string): { ethernetip: EthernetIPSource } {
+function makeSource(device: EipDevice, tag: string, cipType?: string, scanRate?: number): { ethernetip: EthernetIPSource } {
+  const rate = scanRate ?? device.scanRate;
   return {
     ethernetip: {
       deviceId: device.id,
@@ -159,6 +163,7 @@ function makeSource(device: EipDevice, tag: string, cipType?: string): { etherne
       port: device.port,
       tag,
       ...(cipType ? { cipType } : {}),
+      ...(rate ? { scanRate: rate } : {}),
     },
   };
 }
@@ -177,7 +182,7 @@ function makeAtomicVar(
   const base = {
     id,
     description: "",
-    source: makeSource(device, tagName, cipType),
+    source: makeSource(device, tagName, cipType, bulkOptions?.scanRate),
     ...(rbe.disableRBE ? { disableRBE: true } : {}),
   };
   switch (dt) {
@@ -224,8 +229,10 @@ function buildMemberSources(
   tagName: string,
   template: UdtTemplateDefinition,
   templates?: UdtTemplateMap,
+  scanRate?: number,
 ): Record<string, VariableSource> {
   const sources: Record<string, VariableSource> = {};
+  const rate = scanRate ?? device.scanRate;
   for (const member of template.members) {
     // Skip array members — libplctag can't read them as individual tags
     if ("isArray" in member && member.isArray) continue;
@@ -234,7 +241,7 @@ function buildMemberSources(
       const nested = templates[member.templateRef];
       if (nested) {
         // Recurse into nested UDT — prefix member paths with parent member name
-        const nestedSources = buildMemberSources(device, memberTag, nested, templates);
+        const nestedSources = buildMemberSources(device, memberTag, nested, templates, scanRate);
         for (const [nestedPath, source] of Object.entries(nestedSources)) {
           sources[`${member.name}.${nestedPath}`] = source;
         }
@@ -250,6 +257,7 @@ function buildMemberSources(
         port: device.port ?? 44818,
         tag: memberTag,
         cipType,
+        ...(rate ? { scanRate: rate } : {}),
       },
     };
   }
@@ -274,7 +282,7 @@ function makeUdtVar(
     datatype: "udt",
     default: buildUdtDefault(template, templates),
     udtTemplate: template,
-    memberSources: buildMemberSources(device, tagName, template, templates),
+    memberSources: buildMemberSources(device, tagName, template, templates, bulkOptions?.scanRate),
     ...(rbe.deadband ? { deadband: rbe.deadband } : {}),
     ...(rbe.disableRBE ? { disableRBE: true } : {}),
   };

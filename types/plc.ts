@@ -50,6 +50,8 @@ export type PlcConfig<V extends PlcVariablesConfig> = {
   tasks: Record<string, PlcTask<V>>;
   /** NATS connection configuration */
   nats: NatsConfig;
+  /** Skip heartbeat publishing (e.g. when embedded in gateway which has its own heartbeat) */
+  skipHeartbeat?: boolean;
 };
 
 /**
