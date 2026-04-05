@@ -1445,13 +1445,16 @@ export async function setupNats(
       disableRBE: variable?.disableRBE,
     };
 
-    // Include udtTemplate if this UDT variable has a Sparkplug B template definition
-    if (
-      datatype === "udt" && variable && "udtTemplate" in variable &&
-      variable.udtTemplate
-    ) {
-      (schemaMessage as Record<string, unknown>).udtTemplate =
-        variable.udtTemplate;
+    // Include udtTemplate and memberDeadbands if this UDT variable has them
+    if (datatype === "udt" && variable && "udtTemplate" in variable) {
+      if (variable.udtTemplate) {
+        (schemaMessage as Record<string, unknown>).udtTemplate =
+          variable.udtTemplate;
+      }
+      if ("memberDeadbands" in variable && variable.memberDeadbands) {
+        (schemaMessage as Record<string, unknown>).memberDeadbands =
+          variable.memberDeadbands;
+      }
     }
 
     if (!isPlcDataMessage(schemaMessage)) {

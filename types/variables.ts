@@ -173,6 +173,9 @@ export type PlcVariableUdtConfig<T = Record<string, unknown>> = PlcVariableConfi
    *  Each member source drives an individual scanner subscription. The PLC runtime
    *  routes incoming member data into this UDT's value object at the corresponding path. */
   memberSources?: Record<string, VariableSource>;
+  /** Per-member RBE deadband config keyed by member name. Resolved from:
+   *  instance override → template default → device default. */
+  memberDeadbands?: Record<string, DeadBandConfig>;
 };
 
 export type PlcVariableConfig =
